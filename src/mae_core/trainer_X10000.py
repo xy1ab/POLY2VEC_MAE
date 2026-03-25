@@ -7,6 +7,7 @@ import random
 import json
 import shutil
 from datetime import datetime
+import torch_musa
 import torch
 import torch.optim as optim
 import matplotlib.pyplot as plt
@@ -551,7 +552,6 @@ def build_arg_parser():
     parser.add_argument('--data_path', default='./data/processed/polygon_triangles_normalized.pt', type=str)
     parser.add_argument('--save_dir', default='./outputs/checkpoints/', type=str)
     
-    parser.add_argument('--gpu', default="0,1,2,3,4,5,6,7", type=str)
     parser.add_argument('--weight_mag', default=1.0, type=float)
     parser.add_argument('--weight_mag_hf', default=1.0, type=float, help='幅值的高频跨度惩罚权重 (alpha)')
     parser.add_argument('--weight_phase', default=1.0, type=float)

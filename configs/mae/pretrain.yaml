@@ -4,7 +4,7 @@ save_dir: ./outputs/checkpoints/
 export_dir: ./outputs/exports/
 train_type: mae
 
-gpu: "0,1,2,3,4,5,6,7"
+
 weight_mag: 1.0
 weight_mag_hf: 1.0
 weight_phase: 1.0
