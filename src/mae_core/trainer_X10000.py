@@ -354,10 +354,25 @@ def main(args):
         fixed_lengths = torch.tensor([fixed_tris.shape[0]], device=device)
         
         with torch.no_grad():
+            # mag_val_fix, phase_val_fix = fourier_engine.cft_polygon_batch(fixed_batch_tris, fixed_lengths)
+            # raw_mag_orig = torch.expm1(mag_val_fix)
+            # F_uv_orig = (raw_mag_orig * torch.exp(1j * phase_val_fix)).squeeze(1)
+            # spatial_icft_orig = fourier_engine.icft_2d(F_uv_orig)[0].detach().cpu()
+            # H_sp, W_sp = spatial_icft_orig.shape[-2], spatial_icft_orig.shape[-1]
+            # spatial_gt = rasterize_tris_to_grid(fixed_tris.cpu(), H_sp, W_sp)
+
+            # 1. 获取幅值（log1p后）和相位
             mag_val_fix, phase_val_fix = fourier_engine.cft_polygon_batch(fixed_batch_tris, fixed_lengths)
-            raw_mag_orig = torch.expm1(mag_val_fix)
-            F_uv_orig = (raw_mag_orig * torch.exp(1j * phase_val_fix)).squeeze(1)
-            spatial_icft_orig = fourier_engine.icft_2d(F_uv_orig)[0].detach().cpu()
+            # 2. 还原原始幅值
+            raw_mag_orig = torch.expm1(mag_val_fix) # [B, 1, H, W]
+            # 3. 手动构造实部和虚部，替代 F_uv_orig = raw_mag_orig * torch.exp(1j * phase_val_fix)
+            # 根据欧拉公式: exp(j*theta) = cos(theta) + j*sin(theta)
+            F_real = (raw_mag_orig * torch.cos(phase_val_fix)).squeeze(1) # [B, H, W]
+            F_imag = (raw_mag_orig * torch.sin(phase_val_fix)).squeeze(1) # [B, H, W]
+            # 传入实部和虚部两个 Tensor
+            spatial_icft_orig = fourier_engine.icft_2d(F_real, F_imag)[0].detach().cpu()
+
+            # 5. 后续栅格化对比逻辑保持不变
             H_sp, W_sp = spatial_icft_orig.shape[-2], spatial_icft_orig.shape[-1]
             spatial_gt = rasterize_tris_to_grid(fixed_tris.cpu(), H_sp, W_sp)
 
