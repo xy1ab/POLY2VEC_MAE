@@ -1,9 +1,0 @@
-# Downstream reconstruction demo defaults.
-
-shape: circle
-index: 0
-data_path: ../mae_pretrain/data/processed/polygon_triangles_normalized.pt
-mask_ratio: 0.0
-experiment_dir: ../mae_pretrain/outputs/ckpt
-precision: bf16
-save_dir: ./outputs
