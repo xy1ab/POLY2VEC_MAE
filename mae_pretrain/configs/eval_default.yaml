@@ -1,0 +1,18 @@
+# CFT/ICFT 可视化评估默认配置。
+# 对应 `src/engine/evaluator.py` 的参数。
+
+# 待可视化样本索引（在数据集中按顺序取）。
+index: 0
+# 与训练一致的预处理数据路径。
+data_path: ./data/processed/polygon_triangles_normalized.pt
+# 评估可视化图像输出目录。
+save_dir: ./outputs/ckpt/eval
+# 空间域重建栅格大小（S x S）。
+spatial_size: 256
+
+# 频域参数，建议与训练配置保持一致以便对齐。
+pos_freqs: 63
+w_min: 0.1
+w_max: 200.0
+freq_type: geometric
+patch_size: 4
