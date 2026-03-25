@@ -172,24 +172,24 @@ def export_final_artifacts(args, model_to_save, experiment_dir, run_timestamp):
 def main(args):
     is_ddp = "LOCAL_RANK" in os.environ
     if is_ddp:
-        torch.distributed.init_process_group(backend='nccl')
+        torch.distributed.init_process_group(backend='mccl')
         local_rank = int(os.environ["LOCAL_RANK"])
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
+        torch.musa.set_device(local_rank)
+        device = torch.device(f"musa:{local_rank}")
         if local_rank == 0:
             print(f"启动 DDP 多卡模式，World Size: {torch.distributed.get_world_size()}")
     else:
         local_rank = 0
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = torch.device("musa:0" if torch.musa.is_available() else "cpu")
         print(f"启动单卡模式，使用设备: {device}")
 
     train_precision = normalize_precision(args.precision)
     checkpoint_precision = normalize_precision(args.checkpoint_dtype)
-    if device.type != "cuda" and train_precision in ("fp16", "bf16"):
+    if device.type != "musa" and train_precision in ("fp16", "bf16"):
         if local_rank == 0:
             print(f"[Precision] 当前设备为 {device}，自动将训练精度从 {train_precision} 回退为 fp32。")
         train_precision = "fp32"
-    if device.type == "cuda" and train_precision == "bf16" and not torch.cuda.is_bf16_supported():
+    if device.type == "musa" and train_precision == "bf16" and not torch.musa.is_bf16_supported():
         if local_rank == 0:
             print("[Precision] 当前 CUDA 设备不支持 bf16，自动回退到 fp16。")
         train_precision = "fp16"
