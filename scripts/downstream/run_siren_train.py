@@ -5,8 +5,8 @@ import os
 import sys
 import numpy
 # 兼容性补丁：如果数据是用 numpy 2.x 存的，而当前环境是 1.x，这一步能防止崩溃
-if not hasattr(numpy, '_core'):
-    sys.modules['numpy._core'] = numpy.core
+# if not hasattr(numpy, '_core'):
+#     sys.modules['numpy._core'] = numpy.core
 import yaml
 import torch
 import torch.nn as nn
@@ -91,7 +91,7 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=float(cfg['lr']), weight_decay=1e-5)
     
     # 学习率调度器：当 Val Loss 停滞时自动减半学习率
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     criterion = nn.BCELoss()
 
     # ==========================================
