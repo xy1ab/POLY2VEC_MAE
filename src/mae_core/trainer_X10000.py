@@ -533,10 +533,12 @@ def main(args):
                 phase_recon_tensor = torch.atan2(sin_recon_tensor, cos_recon_tensor)
                 
                 raw_mag_recon = torch.expm1(mag_recon_tensor)
-                F_uv_recon = raw_mag_recon * torch.exp(1j * phase_recon_tensor)
-                
-                spatial_icft_recon = fourier_engine.icft_2d(F_uv_recon)[0].squeeze().cpu()
-                
+
+                F_real = raw_mag_recon * cos_recon_tensor
+                F_imag = raw_mag_recon * sin_recon_tensor
+
+                spatial_icft_recon = fourier_engine.icft_2d(F_real.squeeze(1), F_imag.squeeze(1))[0].squeeze().cpu()
+
                 plot_reconstruction(img_orig, img_masked, img_recon, 
                                     spatial_gt, spatial_icft_orig.squeeze(), spatial_icft_recon, 
                                     epoch+1, experiment_dir)
