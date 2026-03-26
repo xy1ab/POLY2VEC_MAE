@@ -29,7 +29,7 @@ def _inject_src_path() -> Path:
 
 def main() -> None:
     """CLI main function for dataset building."""
-    ensure_cuda_runtime_libs()
+    # ensure_cuda_runtime_libs()
     project_root = _inject_src_path()
 
     from datasets.build_dataset import process_and_save
@@ -46,9 +46,26 @@ def main() -> None:
         type=str,
         default=str(project_root / "data" / "processed" / "polygon_triangles_normalized.pt"),
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=0,
+        help="File-level process count. <=0 means auto.",
+    )
+    parser.add_argument(
+        "--shard_size_mb",
+        type=float,
+        default=0.0,
+        help="Target shard size in MB. <=0 means single .pt output.",
+    )
     args = parser.parse_args()
 
-    process_and_save(args.input_dirs, args.output_path)
+    process_and_save(
+        input_dirs=args.input_dirs,
+        output_path=args.output_path,
+        num_workers=args.num_workers,
+        shard_size_mb=args.shard_size_mb,
+    )
 
 
 if __name__ == "__main__":
