@@ -102,7 +102,7 @@ weight_decay: 0.05
 # MAE mask 比例。
 mask_ratio: 0.75
 # 数据增强重复次数（仅训练集）。
-augment_times: 10
+augment_times: 1
 
 # =========================
 # 精度策略
