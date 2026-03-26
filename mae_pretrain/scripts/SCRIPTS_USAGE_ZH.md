@@ -12,7 +12,7 @@ cd /home/xiaoyang/workspace/poly2vec_mae_v1/mae_pretrain
 
 - 入口脚本：`scripts/run_pretrain.py`
   
-- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16(fp13别名)`。
+- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`。
   
 - 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。
   
