@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_bootstrap import ensure_cuda_runtime_libs
+# from runtime_bootstrap import ensure_cuda_runtime_libs
 
 
 def _inject_src_path() -> Path:
@@ -75,16 +75,16 @@ def _normalize_gpu_csv(gpu_list: list[str]) -> str:
     return ",".join(gpu_list)
 
 
-def _is_cuda_available() -> bool:
-    """Check whether CUDA runtime is available for current Python process.
+def _is_musa_available() -> bool:
+    """Check whether MUSA runtime is available for current Python process.
 
     Returns:
-        True when torch can be imported and CUDA is available, else False.
+        True when torch can be imported and MUSA is available, else False.
     """
     try:
         import torch
 
-        return bool(torch.cuda.is_available())
+        return bool(torch.musa.is_available())
     except Exception:
         return False
 
@@ -169,7 +169,7 @@ def _run_torchrun_with_signal_guard(cmd: list[str], env: dict[str, str]) -> int:
 
 def main() -> None:
     """CLI main function for MAE pretraining launch."""
-    ensure_cuda_runtime_libs()
+    # ensure_cuda_runtime_libs()
     project_root = _inject_src_path()
 
     from engine.trainer import run_cli
@@ -204,9 +204,9 @@ def main() -> None:
 
     gpu_from_config = str(config.get("gpu", "0"))
     gpu_list = _split_gpu_list(gpu_from_config)
-    cuda_available = _is_cuda_available()
+    musa_available = _is_musa_available()
 
-    if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and cuda_available:
+    if len(gpu_list) > 1 and "LOCAL_RANK" not in os.environ and not pre_args.no_auto_spawn and musa_available:
         visible_gpu_csv = _normalize_gpu_csv(gpu_list)
         cmd = [
             sys.executable,
@@ -228,7 +228,7 @@ def main() -> None:
         cmd.extend(remaining)
         env = dict(os.environ)
         # Ensure torchrun local ranks map strictly to requested GPU subset.
-        env["CUDA_VISIBLE_DEVICES"] = visible_gpu_csv
+        env["MUSA_VISIBLE_DEVICES"] = visible_gpu_csv
         return_code = _run_torchrun_with_signal_guard(cmd=cmd, env=env)
         if return_code == 0:
             return
@@ -240,9 +240,9 @@ def main() -> None:
             file=sys.stderr,
         )
 
-    if len(gpu_list) > 1 and not pre_args.no_auto_spawn and not cuda_available:
+    if len(gpu_list) > 1 and not pre_args.no_auto_spawn and not musa_available:
         print(
-            "[WARN] Multiple GPUs configured but CUDA is unavailable in current runtime; "
+            "[WARN] Multiple GPUs configured but MUSA is unavailable in current runtime; "
             "fallback to single-process launch.",
             file=sys.stderr,
         )
