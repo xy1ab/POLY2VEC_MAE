@@ -12,5 +12,5 @@ mae_ckpt_path: ""
 config_path: ""
 # 导出的 encoder-only 权重输出路径。
 output_path: ""
-# 导出时加载与保存精度：支持 fp32 / bf16 / fp16；fp13 作为 fp16 兼容别名。
+# 导出时加载与保存精度：支持 fp32 / bf16 / fp16。
 precision: bf16
