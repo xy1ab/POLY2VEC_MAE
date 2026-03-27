@@ -27,9 +27,9 @@ mae_pretrain/tests/__pycache__
 # Data (通常不上传原始/处理后数据)
 downstream/*
 !downstream/.gitkeep
-# Optional: logs/temp
-*.log
-*.tmp
 checkpoints/
 downstream_ocf/checkpoints
 *.pth
+# Optional: logs/temp
+*.log
+*.tmp
