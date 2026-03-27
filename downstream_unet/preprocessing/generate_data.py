@@ -7,15 +7,9 @@ import numpy as np
 import matplotlib.path as mpltPath
 import argparse
 import sys
-# 获取当前文件的绝对路径
-current_dir = os.path.dirname(os.path.abspath(__file__))
-# 向上退两级回到根目录 (preprocessing -> downstream_unet -> root)
-project_root = os.path.abspath(os.path.join(current_dir, "../../"))
 
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-from mae_pretrain.src.datasets.geometry_polygon import PolyFourierConverter
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from geometry_polygon import PolyFourierConverter
 from config import FourierConfig as cfg
 
 def rasterize_triangles(tris, spatial_size=256):
