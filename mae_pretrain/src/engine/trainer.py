@@ -677,7 +677,6 @@ def train_main(args) -> None:
                 print(f"  [Train] Total: {avg_train_loss.item():.4f} | Mag: {avg_train_mag.item():.4f} | Phase: {avg_train_phase.item():.4f}")
                 print(f"  [Val]   Total: {avg_val_loss.item():.4f} | Mag: {avg_val_mag.item():.4f} | Phase: {avg_val_phase.item():.4f}")
 
-
                 if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
                     model_to_save = model.module if isinstance(model, DDP) else model
                     save_checkpoint(
