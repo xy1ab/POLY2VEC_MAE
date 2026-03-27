@@ -78,7 +78,8 @@ def main():
     model = FiLMSirenOCF(
         embed_dim=cfg['embed_dim'], 
         hidden_dim=cfg['hidden_dim'], 
-        num_layers=cfg['num_layers']
+        num_layers=cfg['num_layers'],
+        omega_0=cfg.get('omega_0', 30.0)
     ).to(device)
     model_path = os.path.join(PROJECT_ROOT, cfg['save_dir'], 'siren_ocf_best.pth')
     model.load_state_dict(torch.load(model_path, map_location=device))
@@ -116,7 +117,7 @@ def main():
         
         # 归一化缩放
         cx, cy, s = meta[0], meta[1], meta[2]
-        tris_norm = (tris_raw - np.array([cx, cy])) / (s + 1e-9)
+        tris_norm = (tris_raw - np.array([cx, cy])) / (s/2.0 + 1e-9)
         
         # 诊断打印
         print(f"样本 {idx} | 归一化后坐标 Min/Max: {tris_norm.min():.2f} / {tris_norm.max():.2f}")

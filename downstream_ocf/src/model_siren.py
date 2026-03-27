@@ -52,7 +52,7 @@ class FiLMSirenOCF(nn.Module):
         self.layers = nn.ModuleList()
         self.films = nn.ModuleList()
         for i in range(num_layers - 1):
-            self.layers.append(SineLayer(hidden_dim, hidden_dim, omega_0=1.0))
+            self.layers.append(SineLayer(hidden_dim, hidden_dim, omega_0=omega_0))
             self.films.append(FiLMBlock(embed_dim, hidden_dim))
         
         self.final_linear = nn.Linear(hidden_dim, 1)

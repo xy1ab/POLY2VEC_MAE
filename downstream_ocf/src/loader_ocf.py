@@ -33,17 +33,36 @@ class OCFDataset(Dataset):
         # 对三角形坐标进行中心化和比例缩放
         # 公式：(原始坐标 - 中心点) / 边长
         # 这样多边形就会分布在 [-1, 1] 附近的中心区域
-        tris_norm = (tris_raw - np.array([cx, cy])) / (s + 1e-9)
+        tris_norm = (tris_raw - np.array([cx, cy])) / (s/2.0 + 1e-9)
         
         # --- 智能采样 (在归一化后的空间进行) ---
         n_boundary = int(self.num_points * self.boundary_ratio)
         n_uniform = self.num_points - n_boundary
         
-        verts = tris_norm.reshape(-1, 2)
+        # 【修改前】
+        # verts = tris_norm.reshape(-1, 2)
+        # idx_v = np.random.choice(len(verts), n_boundary)
+        # p_boundary = verts[idx_v] + np.random.normal(0, self.jitter_std, (n_boundary, 2))
+
+        # 【修改后】：在三角形的三条边上进行插值采样
+        v0, v1, v2 = tris_norm[:, 0], tris_norm[:, 1], tris_norm[:, 2]
+        edges = np.concatenate([
+            np.stack([v0, v1], axis=1),
+            np.stack([v1, v2], axis=1),
+            np.stack([v2, v0], axis=1)
+        ], axis=0)
+
+        # 随机选择边
+        idx_e = np.random.choice(len(edges), n_boundary)
+        sampled_edges = edges[idx_e]
+
+        # 沿选定边生成 [0,1] 之间的随机插值系数
+        t = np.random.rand(n_boundary, 1).astype(np.float32)
+        # 线性插值：P = A*(1-t) + B*t，这样点就均匀分布在线段上了！
+        p_edge = sampled_edges[:, 0] * (1 - t) + sampled_edges[:, 1] * t
         
-        # 1. 边界采样：在放大的多边形边缘撒点
-        idx_v = np.random.choice(len(verts), n_boundary)
-        p_boundary = verts[idx_v] + np.random.normal(0, self.jitter_std, (n_boundary, 2))
+        # 最后，在真实的几何边上加入微小的高斯噪声
+        p_boundary = p_edge + np.random.normal(0, self.jitter_std, (n_boundary, 2))
         
         # 2. 全局均匀采样：在整个 [-1, 1] 空间撒点
         p_uniform = np.random.uniform(-1, 1, (n_uniform, 2))
