@@ -16,20 +16,33 @@ import geopandas as gpd
 import numpy as np
 from tqdm import tqdm
 
-from runtime_bootstrap import ensure_cuda_runtime_libs
+if __package__ in {None, ""}:
+    _CURRENT_DIR = Path(__file__).resolve().parent
+    _PROJECT_ROOT = _CURRENT_DIR.parent
+    _REPO_ROOT = _PROJECT_ROOT.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
+    import importlib
+
+    ensure_cuda_runtime_libs = importlib.import_module(
+        "mae_pretrain.scripts.runtime_bootstrap"
+    ).ensure_cuda_runtime_libs
+else:
+    from .runtime_bootstrap import ensure_cuda_runtime_libs
 
 
-def _inject_src_path() -> Path:
-    """Inject local `src` directory into `sys.path`.
+def _inject_repo_root() -> Path:
+    """Inject repository root into `sys.path` for direct script execution.
 
     Returns:
-        Project root path.
+        `mae_pretrain` project root path.
     """
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
+    repo_root = project_root.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     return project_root
 
 
@@ -290,14 +303,34 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     """CLI main function for batch encoding."""
     ensure_cuda_runtime_libs()
-    project_root = _inject_src_path()
+    project_root = _inject_repo_root()
 
     import torch
-    from datasets.geometry_polygon import build_poly_fourier_converter_from_config
-    from engine.pipeline import PolyEncoderPipeline
-    from utils.config import load_config_any
-    from utils.filesystem import ensure_dir
-    from utils.precision import normalize_precision
+
+    if __package__ in {None, ""}:
+        import importlib
+
+        build_poly_fourier_converter_from_config = importlib.import_module(
+            "mae_pretrain.src.datasets.geometry_polygon"
+        ).build_poly_fourier_converter_from_config
+        PolyEncoderPipeline = importlib.import_module(
+            "mae_pretrain.src.engine.pipeline"
+        ).PolyEncoderPipeline
+        load_config_any = importlib.import_module(
+            "mae_pretrain.src.utils.config"
+        ).load_config_any
+        ensure_dir = importlib.import_module(
+            "mae_pretrain.src.utils.filesystem"
+        ).ensure_dir
+        normalize_precision = importlib.import_module(
+            "mae_pretrain.src.utils.precision"
+        ).normalize_precision
+    else:
+        from ..src.datasets.geometry_polygon import build_poly_fourier_converter_from_config
+        from ..src.engine.pipeline import PolyEncoderPipeline
+        from ..src.utils.config import load_config_any
+        from ..src.utils.filesystem import ensure_dir
+        from ..src.utils.precision import normalize_precision
 
     args = build_arg_parser().parse_args()
     args.precision = normalize_precision(args.precision)

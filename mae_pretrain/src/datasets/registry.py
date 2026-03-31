@@ -8,9 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from datasets.geometry_line import LineGeometryCodec
-from datasets.geometry_point import PointGeometryCodec
-from datasets.geometry_polygon import PolygonGeometryCodec
+from .geometry_line import LineGeometryCodec
+from .geometry_point import PointGeometryCodec
+from .geometry_polygon import PolygonGeometryCodec
 
 
 def get_geometry_codec(geom_type: str, config: dict[str, Any], device: str):

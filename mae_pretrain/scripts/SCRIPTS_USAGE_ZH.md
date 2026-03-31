@@ -5,16 +5,16 @@ source /home/xiaoyang/miniconda3/etc/profile.d/conda.sh
 
 conda activate p2v
 
-cd /home/xiaoyang/workspace/poly2vec_mae_v1/mae_pretrain
+cd /home/xiaoyang/workspace/poly2vec_mae/mae_pretrain
 ```
 
 ### 1 预训练启动
 
 - 入口脚本：`scripts/run_pretrain.py`
   
-- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；支持用 `--viz_every` 控制 PNG 可视化输出间隔（按 epoch）。
+- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；训练输出统一写入 `<save_dir>/<run_timestamp>/best` 与 `ckpt`；支持用 `--resume_dir` 从既有 run 目录续训。
   
-- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--viz_every` 默认 `1`（每个 epoch 输出），例如 `10` 表示每 10 个 epoch 输出一次。
+- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。
   
 - 调取示例：
   
@@ -34,7 +34,18 @@ python scripts/run_pretrain.py \
 
   --mask_ratio 0.75 \
 
-  --viz_every 10
+  --eval_every 10
+```
+
+- 续训示例：
+
+```bash
+python scripts/run_pretrain.py \
+  --resume_dir ./outputs/ckpt/20260331_1911 \
+  --epochs 200 \
+  --gpu 0,1 \
+  --num_workers 8 \
+  --eval_every 5
 ```
 
 ### 2 模型重建可视化评估
@@ -91,11 +102,12 @@ python scripts/run_export.py \
 
 - 入口脚本：`scripts/run_build_dataset.py`
   
-- 具体功能：扫描输入目录中的矢量数据，按“输入任务”并行执行 polygon 三角剖分（`shp/geojs` 为每文件任务，`gdb` 为每图层任务；支持 MultiPolygon 与 donut），对退化三角形进行过滤（面积过小/近共线），并保存为单个 `.pt` 或多个分块 `.pt` 文件。
+- 具体功能：扫描输入目录中的矢量数据，按任务顺序逐个处理（`shp/geojs` 为每文件任务，`gdb` 为每图层任务）；每个任务内部按行分块并行进行 polygon 三角剖分（支持 MultiPolygon 与 donut），并对退化三角形进行过滤（面积过小/近共线）；结果保存为单个 `.pt` 或多个分块 `.pt` 文件。入口脚本已避免通过 `datasets` 包导入链触发额外模块加载；输出文件采用 `torch.save` 序列化（与训练侧 `torch.load` 直接兼容）。
   
 - 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`。  
-  常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_path`（输出基路径）、`--num_workers`（文件级并行进程数，`<=0` 自动）、`--shard_size_mb`（分块大小，`<=0` 不分块）、`--min_triangle_area`（最小三角面积阈值）、`--min_triangle_height`（最小高阈值）、`--log`（输出三角剖分日志）。  
-  当使用 `--log` 时，日志默认保存到与输出 `.pt` 同目录，命名为 `<output_path_stem>.triangulation_log.json`。
+  常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_dir`（输出目录）、`--num_workers`（任务内并行进程数，`<=0` 自动，也兼容 `--num_worker`）、`--rows_per_chunk`（任务内每个分块处理的行数，默认 `2000`）、`--progress_every_chunks`（每合并 N 个分块打印一次摘要，默认 `10`，`<=0` 关闭）、`--shard_size_mb`（分块大小，`<=0` 不分块）、`--min_triangle_area`（最小三角面积阈值，默认 `1e-8`）、`--min_triangle_height`（最小高阈值，默认 `1e-5`）、`--log`（输出三角剖分日志）。  
+  当 `file_type=shp` 时，分块命名为 `<shpfilename>_tri_part_<xxxx>.pt`（例如 `hangzhou_tri_part_0001.pt`）。  
+  当使用 `--log` 时，日志默认保存到同一目录，命名为 `<shpfilename>_tri.triangulation_log.json`。
   
 - 调取示例：
   
@@ -105,9 +117,13 @@ python scripts/run_build_dataset.py \
 
   --input_dirs /data/raw/vector_a /data/raw/vector_b \
 
-  --output_path ./data/processed/polygon_triangles_normalized.pt \
+  --output_dir ./data/processed \
 
   --num_workers 16 \
+
+  --rows_per_chunk 2000 \
+
+  --progress_every_chunks 10 \
 
   --shard_size_mb 500 \
 
@@ -123,7 +139,7 @@ python scripts/run_build_dataset.py \
   --input_dirs /data/boua \
   --file_type gdb \
   --layer BUILDING \
-  --output_path ./data/processed/building_triangles.pt \
+  --output_dir ./data/processed \
   --num_workers 8 \
   --log
 ```

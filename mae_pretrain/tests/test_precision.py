@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from utils.precision import normalize_precision
+from ..src.utils.precision import normalize_precision
 
 
 def test_precision_fp13_is_rejected() -> None:

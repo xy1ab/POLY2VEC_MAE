@@ -12,11 +12,11 @@ from typing import Any
 
 import torch
 
-from models.encoder import PolyEncoder
-from models.mae import MaskedAutoencoderViTPoly
-from utils.checkpoint import save_checkpoint
-from utils.config import load_config_any
-from utils.precision import normalize_precision, precision_to_torch_dtype, resolve_precision_for_device
+from .encoder import PolyEncoder
+from .mae import MaskedAutoencoderViTPoly
+from ..utils.checkpoint import save_checkpoint
+from ..utils.config import load_config_any
+from ..utils.precision import normalize_precision, precision_to_torch_dtype, resolve_precision_for_device
 
 
 def infer_img_size_from_config(config: dict[str, Any]) -> tuple[int, int]:

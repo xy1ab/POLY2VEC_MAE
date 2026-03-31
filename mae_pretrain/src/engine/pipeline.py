@@ -14,11 +14,11 @@ from typing import Sequence
 import numpy as np
 import torch
 
-from datasets.geometry_polygon import ensure_polygon_array, normalize_polygon_bbox, pad_triangle_batch
-from datasets.registry import get_geometry_codec
-from models.factory import load_mae_model, load_pretrained_encoder
-from utils.config import load_config_any
-from utils.precision import autocast_context, normalize_precision
+from ..datasets.geometry_polygon import ensure_polygon_array, normalize_polygon_bbox, pad_triangle_batch
+from ..datasets.registry import get_geometry_codec
+from ..models.factory import load_mae_model, load_pretrained_encoder
+from ..utils.config import load_config_any
+from ..utils.precision import autocast_context, normalize_precision
 
 
 class PolyEncoderPipeline:
