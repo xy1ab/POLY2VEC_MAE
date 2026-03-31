@@ -14,10 +14,10 @@ import numpy as np
 import torch
 from matplotlib.path import Path as MplPath
 
-from datasets.registry import get_geometry_codec
-from utils.config import load_yaml_config
-from utils.filesystem import ensure_dir
-from utils.safe_load import register_numpy_safe_globals
+from ..datasets.registry import get_geometry_codec
+from ..utils.config import load_yaml_config
+from ..utils.filesystem import ensure_dir
+from ..utils.safe_load import register_numpy_safe_globals
 
 
 def rasterize_triangles(tris: np.ndarray, spatial_size: int = 256) -> np.ndarray:

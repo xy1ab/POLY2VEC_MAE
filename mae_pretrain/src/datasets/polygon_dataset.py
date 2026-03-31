@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from datasets.transforms import augment_triangles
+from .transforms import augment_triangles
 
 
 class PolyMAEDataset(Dataset):

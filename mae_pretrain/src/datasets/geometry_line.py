@@ -6,7 +6,7 @@ engine code closed for modification and open for extension.
 
 from __future__ import annotations
 
-from datasets.geometry_codec_base import GeometryCodec
+from .geometry_codec_base import GeometryCodec
 
 
 class LineGeometryCodec(GeometryCodec):
