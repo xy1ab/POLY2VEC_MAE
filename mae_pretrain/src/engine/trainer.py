@@ -13,8 +13,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
 import time
+import warnings
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -36,13 +36,36 @@ from ..datasets.sharded_pt_dataset import (
 )
 from ..losses.recon_mag_phase import compute_mag_phase_losses
 from ..models.mae import MaskedAutoencoderViTPoly
-from ..utils.checkpoint import export_model_bundle, save_checkpoint
+from ..utils.checkpoint import (
+    load_latest_training_state,
+    save_checkpoint,
+    save_latest_training_state_pair,
+)
+from ..utils.config import dump_yaml_config
 from ..utils.dist import DistContext, all_reduce_mean, cleanup_distributed, init_distributed, is_main_process
-from ..utils.filesystem import make_timestamped_dir
+from ..utils.filesystem import ensure_dir, make_timestamped_dir
 from ..utils.logger import attach_tee_stdout
 from ..utils.precision import autocast_context, build_grad_scaler, normalize_precision
 from ..utils.safe_load import register_numpy_safe_globals
-from ..utils.seed import set_global_seed
+from ..utils.seed import capture_rng_state, restore_rng_state, set_global_seed
+
+
+_RESUME_LOCKED_KEYS = {
+    "geom_type",
+    "data_dir",
+    "data_path",
+    "patch_size",
+    "embed_dim",
+    "depth",
+    "num_heads",
+    "dec_embed_dim",
+    "dec_depth",
+    "dec_num_heads",
+    "pos_freqs",
+    "w_min",
+    "w_max",
+    "freq_type",
+}
 
 
 def patchify(imgs: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -312,6 +335,116 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
     return model
 
 
+def _build_scheduler(args, optimizer):
+    """Construct the epoch scheduler from runtime arguments."""
+    if args.warmup_epochs > 0:
+        warmup_scheduler = optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=args.min_lr / args.lr,
+            total_iters=args.warmup_epochs,
+        )
+        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs - args.warmup_epochs),
+            eta_min=args.min_lr,
+        )
+        return optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, cosine_scheduler],
+            milestones=[args.warmup_epochs],
+        )
+
+    return optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+        eta_min=args.min_lr,
+    )
+
+
+def _advance_scheduler(scheduler, completed_epochs: int) -> None:
+    """Advance one freshly-built epoch scheduler to the resumed epoch index."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        for _ in range(max(0, int(completed_epochs))):
+            scheduler.step()
+
+
+def _normalize_config_value(key: str, value):
+    """Normalize config values before resume-compatibility comparison."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip().lower() == "none":
+        return None
+    if key.endswith("_dir") or key.endswith("_path"):
+        return str(Path(str(value)).expanduser().resolve())
+    return value
+
+
+def _validate_resume_config(args, saved_run_config: dict) -> None:
+    """Validate that resume-time overrides keep checkpoint compatibility."""
+    for key in _RESUME_LOCKED_KEYS:
+        current_value = _normalize_config_value(key, getattr(args, key, None))
+        saved_value = _normalize_config_value(key, saved_run_config.get(key))
+        if current_value != saved_value:
+            raise ValueError(
+                f"Resume config mismatch for `{key}`: current={current_value}, saved={saved_value}"
+            )
+
+
+def _validate_resume_manifest(resume_state: dict, pt_files: list[Path], manifest: PtShardManifest) -> None:
+    """Validate saved data manifest metadata against current runtime files."""
+    saved_pt_files = [str(Path(path).expanduser().resolve()) for path in resume_state.get("pt_files", [])]
+    current_pt_files = [str(path.expanduser().resolve()) for path in pt_files]
+    if saved_pt_files and saved_pt_files != current_pt_files:
+        raise ValueError("Resume data files do not match the checkpoint manifest.")
+
+    saved_total_samples = resume_state.get("manifest_total_samples")
+    if saved_total_samples is not None and int(saved_total_samples) != int(manifest.total_samples):
+        raise ValueError(
+            "Resume dataset sample count does not match the checkpoint manifest: "
+            f"current={manifest.total_samples}, saved={saved_total_samples}"
+        )
+
+
+def _move_optimizer_state_to_device(optimizer, device: torch.device) -> None:
+    """Move optimizer state tensors onto the current runtime device."""
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if torch.is_tensor(value):
+                state[key] = value.to(device=device)
+
+
+def _apply_optimizer_runtime_overrides(optimizer, args) -> None:
+    """Apply resume-time optimizer hyperparameter overrides."""
+    for group in optimizer.param_groups:
+        group["lr"] = args.lr
+        group["weight_decay"] = args.weight_decay
+        group["initial_lr"] = args.lr
+
+
+def _is_eval_epoch(epoch_index: int, total_epochs: int, eval_every: int) -> bool:
+    """Check whether current epoch should run validation/checkpoint logic."""
+    epoch_number = epoch_index + 1
+    return epoch_number % eval_every == 0 or epoch_number == total_epochs
+
+
+def _write_json(path: str | Path, payload: dict) -> Path:
+    """Write one JSON file with UTF-8 encoding and pretty formatting."""
+    out_path = Path(path)
+    ensure_dir(out_path.parent)
+    with out_path.open("w", encoding="utf-8") as fp:
+        json.dump(payload, fp, indent=4, ensure_ascii=False)
+    return out_path
+
+
+def _sync_run_metadata(best_dir: Path, ckpt_dir: Path, run_config: dict, model_config: dict) -> None:
+    """Persist training config and model config into both `best/` and `ckpt/`."""
+    dump_yaml_config(run_config, best_dir / "config.yaml")
+    dump_yaml_config(run_config, ckpt_dir / "config.yaml")
+    _write_json(best_dir / "poly_mae_config.json", model_config)
+    _write_json(ckpt_dir / "poly_mae_config.json", model_config)
+
+
 def _resolve_training_pt_files(args) -> list[Path]:
     """Resolve training shard files from directory input or compatibility path.
 
@@ -368,7 +501,13 @@ def _split_dataset_indices(total_size: int, val_ratio: float, split_seed: int) -
     return train_indices, val_indices
 
 
-def _build_datasets(args, manifest: PtShardManifest, dist_ctx: DistContext):
+def _build_datasets(
+    args,
+    manifest: PtShardManifest,
+    dist_ctx: DistContext,
+    train_indices: list[int] | None = None,
+    val_indices: list[int] | None = None,
+):
     """Build train/validation datasets for eager or lazy loading.
 
     Args:
@@ -379,11 +518,15 @@ def _build_datasets(args, manifest: PtShardManifest, dist_ctx: DistContext):
     Returns:
         Tuple `(train_dataset, val_dataset, cache_shards)`.
     """
-    train_indices, val_indices = _split_dataset_indices(
-        total_size=manifest.total_samples,
-        val_ratio=args.val_ratio,
-        split_seed=args.split_seed,
-    )
+    if train_indices is None or val_indices is None:
+        train_indices, val_indices = _split_dataset_indices(
+            total_size=manifest.total_samples,
+            val_ratio=args.val_ratio,
+            split_seed=args.split_seed,
+        )
+    else:
+        train_indices = [int(index) for index in train_indices]
+        val_indices = [int(index) for index in val_indices]
 
     if args.load_mode == "eager":
         all_samples = load_all_samples_from_manifest(manifest)
@@ -397,7 +540,7 @@ def _build_datasets(args, manifest: PtShardManifest, dist_ctx: DistContext):
             sample_indices=val_indices,
             augment_times=1,
         )
-        return train_dataset, val_dataset, None
+        return train_dataset, val_dataset, None, train_indices, val_indices
 
     max_cached_shards = manifest.recommend_cache_shards(
         world_size=dist_ctx.world_size,
@@ -415,7 +558,7 @@ def _build_datasets(args, manifest: PtShardManifest, dist_ctx: DistContext):
         augment_times=1,
         max_cached_shards=max_cached_shards,
     )
-    return train_dataset, val_dataset, max_cached_shards
+    return train_dataset, val_dataset, max_cached_shards, train_indices, val_indices
 
 
 def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
@@ -493,12 +636,6 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
         Tuple `(fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig)`.
     """
     fixed_tris_orig = val_dataset.get_base_sample(0)
-    random.seed(args.split_seed)
-    np.random.seed(args.split_seed)
-
-    # Use the raw validation sample for visualization.
-    # This keeps train/val/viz behavior aligned when augment_times=1 and avoids
-    # hidden augmentation in reconstruction PNGs.
     fixed_tris = torch.tensor(fixed_tris_orig, dtype=torch.float32)
 
     fixed_batch_tris = fixed_tris.unsqueeze(0).to(device)
@@ -533,6 +670,10 @@ def train_main(args) -> None:
         args: Parsed training arguments namespace.
     """
     register_numpy_safe_globals()
+    args.load_mode = str(args.load_mode).lower()
+    args.resume_dir = str(Path(args.resume_dir).expanduser().resolve()) if args.resume_dir else None
+    args.eval_every = max(1, int(args.eval_every))
+
     set_global_seed(args.seed, deterministic=args.deterministic)
 
     dist_ctx = init_distributed()
@@ -540,17 +681,41 @@ def train_main(args) -> None:
 
     args.precision = normalize_precision(args.precision)
     args.checkpoint_dtype = normalize_precision(args.checkpoint_dtype)
-
     scaler = build_grad_scaler(device=device, precision=args.precision)
-    args.viz_every = max(1, int(args.viz_every))
+
     max_train_steps = max(0, int(getattr(args, "max_train_steps", 0)))
     max_val_steps = max(0, int(getattr(args, "max_val_steps", 0)))
 
+    resume_state = None
+    resume_path = None
+    start_epoch = 0
+    best_val_loss = float("inf")
+
+    if args.resume_dir:
+        resume_state, resume_path = load_latest_training_state(args.resume_dir)
+        saved_run_config = dict(resume_state.get("run_config", {}))
+        _validate_resume_config(args, saved_run_config)
+        start_epoch = int(resume_state.get("completed_epoch", 0))
+        best_val_loss = float(resume_state.get("best_val_loss", float("inf")))
+        if args.epochs <= start_epoch:
+            raise ValueError(
+                f"Resume target epochs must exceed completed epochs: completed={start_epoch}, target={args.epochs}"
+            )
+
     if is_main_process(dist_ctx):
-        run_dir, run_timestamp = make_timestamped_dir(args.save_dir)
-        attach_tee_stdout(run_dir / "train_log.txt")
+        if args.resume_dir:
+            run_dir = Path(args.resume_dir)
+            run_timestamp = run_dir.name
+        else:
+            run_dir, run_timestamp = make_timestamped_dir(args.save_dir)
+
+        best_dir = ensure_dir(run_dir / "best")
+        ckpt_dir = ensure_dir(run_dir / "ckpt")
+        viz_dir = ensure_dir(ckpt_dir / "viz")
+        attach_tee_stdout(best_dir / "train_log.txt")
+
         print("\n[INFO] ========================================================")
-        print(f"[INFO] Save directory : {run_dir}")
+        print(f"[INFO] Run directory   : {run_dir}")
         print(f"[INFO] Precision      : train={args.precision}, ckpt={args.checkpoint_dtype}")
         print(
             "[INFO] Distributed    : "
@@ -558,6 +723,10 @@ def train_main(args) -> None:
             f"rank={dist_ctx.rank}, local_rank={dist_ctx.local_rank}, device={device}, "
             f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
         )
+        print(f"[INFO] Eval frequency  : every {args.eval_every} epoch(s)")
+        if args.resume_dir:
+            print(f"[INFO] Resume mode    : dir={args.resume_dir}, checkpoint={resume_path}")
+            print(f"[INFO] Resume state   : completed_epoch={start_epoch}, best_val_loss={best_val_loss:.6f}")
         if max_train_steps > 0 or max_val_steps > 0:
             print(
                 "[INFO] Debug limits   : "
@@ -566,52 +735,68 @@ def train_main(args) -> None:
             )
         print("[INFO] ========================================================\n")
     else:
-        run_dir = Path(args.save_dir)
-        run_timestamp = "distributed_worker"
+        run_dir = Path(args.resume_dir) if args.resume_dir else Path(args.save_dir)
+        run_timestamp = run_dir.name if args.resume_dir else "distributed_worker"
+        best_dir = run_dir / "best"
+        ckpt_dir = run_dir / "ckpt"
+        viz_dir = ckpt_dir / "viz"
 
     codec = get_geometry_codec(args.geom_type, vars(args), device=str(device))
     converter = codec.converter
     img_size = (converter.U.shape[0], converter.U.shape[1])
-
     model_config = _build_model_config(args, img_size=img_size)
 
+    run_config = dict(vars(args))
+
     if is_main_process(dist_ctx):
-        with (run_dir / "poly_mae_config.json").open("w", encoding="utf-8") as fp:
-            json.dump(model_config, fp, indent=4, ensure_ascii=False)
+        _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
 
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
+    model_to_save = model.module if isinstance(model, DDP) else model
+
+    if resume_state is not None:
+        model_to_save.load_state_dict(resume_state["model_state"], strict=True)
+
     count_parameters(model)
+
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state["optimizer_state"])
+        _move_optimizer_state_to_device(optimizer, device=device)
+        _apply_optimizer_runtime_overrides(optimizer, args)
 
-    if args.warmup_epochs > 0:
-        warmup_scheduler = optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=args.min_lr / args.lr,
-            total_iters=args.warmup_epochs,
-        )
-        cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, args.epochs - args.warmup_epochs),
-            eta_min=args.min_lr,
-        )
-        scheduler = optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, cosine_scheduler],
-            milestones=[args.warmup_epochs],
-        )
-    else:
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.min_lr,
-        )
+    scheduler = _build_scheduler(args, optimizer)
+    if start_epoch > 0:
+        _advance_scheduler(scheduler, completed_epochs=start_epoch)
 
-    args.load_mode = str(args.load_mode).lower()
+    if resume_state is not None:
+        saved_precision = normalize_precision(resume_state.get("train_precision", args.precision))
+        scaler_state = resume_state.get("scaler_state")
+        if scaler_state and scaler.is_enabled() and saved_precision == args.precision:
+            scaler.load_state_dict(scaler_state)
+
     pt_files = _resolve_training_pt_files(args)
     manifest = PtShardManifest.from_pt_files(pt_files)
-    train_dataset, val_dataset, cache_shards = _build_datasets(args, manifest, dist_ctx)
+
+    if resume_state is not None:
+        _validate_resume_manifest(resume_state, pt_files=pt_files, manifest=manifest)
+        saved_train_indices = resume_state.get("train_indices")
+        saved_val_indices = resume_state.get("val_indices")
+        if saved_train_indices is None or saved_val_indices is None:
+            raise ValueError("Resume checkpoint is missing saved dataset split indices.")
+    else:
+        saved_train_indices = None
+        saved_val_indices = None
+
+    train_dataset, val_dataset, cache_shards, train_indices, val_indices = _build_datasets(
+        args,
+        manifest,
+        dist_ctx,
+        train_indices=saved_train_indices,
+        val_indices=saved_val_indices,
+    )
 
     if is_main_process(dist_ctx):
         total_size_mb = manifest.total_size_bytes / (1024.0 * 1024.0)
@@ -641,8 +826,11 @@ def train_main(args) -> None:
     else:
         fixed_batch_tris = fixed_lengths = spatial_gt = spatial_icft_orig = None
 
+    if resume_state is not None:
+        restore_rng_state(resume_state.get("rng_state"))
+
     try:
-        for epoch in range(args.epochs):
+        for epoch in range(start_epoch, args.epochs):
             if dist_ctx.enabled and train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
@@ -697,138 +885,173 @@ def train_main(args) -> None:
                 if max_train_steps > 0 and train_steps >= max_train_steps:
                     break
 
-            avg_train_loss = torch.tensor(train_total / max(1, train_steps), device=device)
-            avg_train_mag = torch.tensor(train_mag / max(1, train_steps), device=device)
-            avg_train_phase = torch.tensor(train_phase / max(1, train_steps), device=device)
+            avg_train_loss = all_reduce_mean(
+                torch.tensor(train_total / max(1, train_steps), device=device),
+                dist_ctx,
+            )
+            avg_train_mag = all_reduce_mean(
+                torch.tensor(train_mag / max(1, train_steps), device=device),
+                dist_ctx,
+            )
+            avg_train_phase = all_reduce_mean(
+                torch.tensor(train_phase / max(1, train_steps), device=device),
+                dist_ctx,
+            )
 
-            model.eval()
-            val_total, val_mag, val_phase = 0.0, 0.0, 0.0
-            val_steps = 0
+            should_eval = _is_eval_epoch(epoch, total_epochs=args.epochs, eval_every=args.eval_every)
+            avg_val_loss = avg_val_mag = avg_val_phase = None
 
-            with torch.no_grad():
-                for val_step, (val_batch_tris, val_lengths) in enumerate(val_loader):
-                    mag_v, phase_v = codec.cft_batch(val_batch_tris, val_lengths)
-                    imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
+            if should_eval:
+                model.eval()
+                val_total, val_mag, val_phase = 0.0, 0.0, 0.0
+                val_steps = 0
 
-                    with autocast_context(device, args.precision):
-                        _, _, _, pred_v, mask_v = model(imgs_v, mask_ratio=args.mask_ratio)
+                with torch.no_grad():
+                    for _, (val_batch_tris, val_lengths) in enumerate(val_loader):
+                        mag_v, phase_v = codec.cft_batch(val_batch_tris, val_lengths)
+                        imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
 
-                    pred_v = pred_v.float()
-                    mask_v = mask_v.float()
-                    target_patches_v = patchify(imgs_v, args.patch_size).float()
+                        with autocast_context(device, args.precision):
+                            _, _, _, pred_v, mask_v = model(imgs_v, mask_ratio=args.mask_ratio)
 
-                    loss_mag_v, loss_phase_v = compute_mag_phase_losses(
-                        pred=pred_v,
-                        target_patches=target_patches_v,
-                        mask=mask_v,
-                        patch_size=args.patch_size,
-                        freq_span_patches=freq_span_patches,
-                        weight_mag_hf=args.weight_mag_hf,
-                    )
+                        pred_v = pred_v.float()
+                        mask_v = mask_v.float()
+                        target_patches_v = patchify(imgs_v, args.patch_size).float()
 
-                    loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
-                    val_total += loss_total_v.item()
-                    val_mag += loss_mag_v.item()
-                    val_phase += loss_phase_v.item()
-                    val_steps += 1
+                        loss_mag_v, loss_phase_v = compute_mag_phase_losses(
+                            pred=pred_v,
+                            target_patches=target_patches_v,
+                            mask=mask_v,
+                            patch_size=args.patch_size,
+                            freq_span_patches=freq_span_patches,
+                            weight_mag_hf=args.weight_mag_hf,
+                        )
 
-                    if max_val_steps > 0 and val_steps >= max_val_steps:
-                        break
+                        loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
+                        val_total += loss_total_v.item()
+                        val_mag += loss_mag_v.item()
+                        val_phase += loss_phase_v.item()
+                        val_steps += 1
 
-            avg_val_loss = torch.tensor(val_total / max(1, val_steps), device=device)
-            avg_val_mag = torch.tensor(val_mag / max(1, val_steps), device=device)
-            avg_val_phase = torch.tensor(val_phase / max(1, val_steps), device=device)
+                        if max_val_steps > 0 and val_steps >= max_val_steps:
+                            break
 
-            avg_train_loss = all_reduce_mean(avg_train_loss, dist_ctx)
-            avg_train_mag = all_reduce_mean(avg_train_mag, dist_ctx)
-            avg_train_phase = all_reduce_mean(avg_train_phase, dist_ctx)
-            avg_val_loss = all_reduce_mean(avg_val_loss, dist_ctx)
-            avg_val_mag = all_reduce_mean(avg_val_mag, dist_ctx)
-            avg_val_phase = all_reduce_mean(avg_val_phase, dist_ctx)
+                avg_val_loss = all_reduce_mean(
+                    torch.tensor(val_total / max(1, val_steps), device=device),
+                    dist_ctx,
+                )
+                avg_val_mag = all_reduce_mean(
+                    torch.tensor(val_mag / max(1, val_steps), device=device),
+                    dist_ctx,
+                )
+                avg_val_phase = all_reduce_mean(
+                    torch.tensor(val_phase / max(1, val_steps), device=device),
+                    dist_ctx,
+                )
 
             current_lr = optimizer.param_groups[0]["lr"]
 
             if is_main_process(dist_ctx):
                 print(f"Epoch {epoch + 1} Completed in {time.time() - start_time:.2f}s | LR: {current_lr:.2e}")
-                print(f"  [Train] Total: {avg_train_loss.item():.4f} | Mag: {avg_train_mag.item():.4f} | Phase: {avg_train_phase.item():.4f}")
-                print(f"  [Val]   Total: {avg_val_loss.item():.4f} | Mag: {avg_val_mag.item():.4f} | Phase: {avg_val_phase.item():.4f}")
+                print(
+                    f"  [Train] Total: {avg_train_loss.item():.4f} | "
+                    f"Mag: {avg_train_mag.item():.4f} | Phase: {avg_train_phase.item():.4f}"
+                )
+                if should_eval and avg_val_loss is not None and avg_val_mag is not None and avg_val_phase is not None:
+                    print(
+                        f"  [Val]   Total: {avg_val_loss.item():.4f} | "
+                        f"Mag: {avg_val_mag.item():.4f} | Phase: {avg_val_phase.item():.4f}"
+                    )
 
-                if (epoch + 1) % args.viz_every == 0:
-                    with torch.no_grad():
-                        mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
-                        imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
+            if should_eval and is_main_process(dist_ctx):
+                with torch.no_grad():
+                    mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
+                    imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
 
-                        with autocast_context(device, args.precision):
-                            _, _, _, pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
+                    with autocast_context(device, args.precision):
+                        _, _, _, pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
 
-                        pred_fix = pred_fix.float()
-                        mask_fix = mask_fix.float()
+                    pred_fix = pred_fix.float()
+                    mask_fix = mask_fix.float()
 
-                        p = args.patch_size
-                        h, w = imgs_fix.shape[2], imgs_fix.shape[3]
-                        h_p, w_p = h // p, w // p
+                    p = args.patch_size
+                    h, w = imgs_fix.shape[2], imgs_fix.shape[3]
+                    h_p, w_p = h // p, w // p
 
-                        img_orig = imgs_fix[0].cpu()
+                    img_orig = imgs_fix[0].cpu()
 
-                        mask_map = mask_fix[0].cpu().reshape(h_p, w_p, 1, 1).expand(-1, -1, p, p)
-                        mask_map = mask_map.permute(0, 2, 1, 3).reshape(h, w)
+                    mask_map = mask_fix[0].cpu().reshape(h_p, w_p, 1, 1).expand(-1, -1, p, p)
+                    mask_map = mask_map.permute(0, 2, 1, 3).reshape(h, w)
 
-                        img_masked = img_orig.clone()
-                        img_masked[:, mask_map == 1] = torch.nan
+                    img_masked = img_orig.clone()
+                    img_masked[:, mask_map == 1] = torch.nan
 
-                        pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
-                        pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
+                    pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
+                    pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
 
-                        img_recon = img_orig.clone()
-                        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
+                    img_recon = img_orig.clone()
+                    img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
 
-                        mag_recon = img_recon[0].unsqueeze(0).to(device)
-                        cos_recon = img_recon[1].unsqueeze(0).to(device)
-                        sin_recon = img_recon[2].unsqueeze(0).to(device)
+                    mag_recon = img_recon[0].unsqueeze(0).to(device)
+                    cos_recon = img_recon[1].unsqueeze(0).to(device)
+                    sin_recon = img_recon[2].unsqueeze(0).to(device)
 
-                        phase_recon = torch.atan2(sin_recon, cos_recon)
-                        real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
-                        spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
+                    phase_recon = torch.atan2(sin_recon, cos_recon)
+                    real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
+                    spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
 
-                        plot_reconstruction(
-                            img_orig=img_orig,
-                            img_masked=img_masked,
-                            img_recon=img_recon,
-                            spatial_gt=spatial_gt,
-                            spatial_icft_orig=spatial_icft_orig.squeeze(),
-                            spatial_icft_recon=spatial_icft_recon,
-                            epoch=epoch + 1,
-                            save_dir=run_dir,
-                        )
+                    plot_reconstruction(
+                        img_orig=img_orig,
+                        img_masked=img_masked,
+                        img_recon=img_recon,
+                        spatial_gt=spatial_gt,
+                        spatial_icft_orig=spatial_icft_orig.squeeze(),
+                        spatial_icft_recon=spatial_icft_recon,
+                        epoch=epoch + 1,
+                        save_dir=viz_dir,
+                    )
 
-                if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
-                    model_to_save = model.module if isinstance(model, DDP) else model
+                current_val_loss = float(avg_val_loss.item())
+                if current_val_loss < best_val_loss:
+                    best_val_loss = current_val_loss
                     save_checkpoint(
-                        run_dir / f"mae_ckpt_{epoch + 1}.pth",
+                        best_dir / "mae_best.pth",
                         model_to_save.state_dict(),
                         precision=args.checkpoint_dtype,
                     )
                     save_checkpoint(
-                        run_dir / f"poly_encoder_epoch_{epoch + 1}.pth",
+                        best_dir / "encoder_best.pth",
                         model_to_save.encoder.state_dict(),
                         precision=args.checkpoint_dtype,
                     )
-                    print(f"  [Save] Saved checkpoints at epoch {epoch + 1}")
+                    print(f"  [Best] Updated best checkpoint at epoch {epoch + 1} | val={best_val_loss:.4f}")
+
+                train_state = {
+                    "checkpoint_version": 1,
+                    "completed_epoch": epoch + 1,
+                    "best_val_loss": best_val_loss,
+                    "model_state": model_to_save.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict(),
+                    "scaler_state": scaler.state_dict(),
+                    "rng_state": capture_rng_state(),
+                    "train_indices": train_indices,
+                    "val_indices": val_indices,
+                    "run_config": dict(vars(args)),
+                    "model_config": model_config,
+                    "run_timestamp": run_timestamp,
+                    "run_dir": str(run_dir),
+                    "train_precision": args.precision,
+                    "pt_files": [str(path) for path in pt_files],
+                    "manifest_total_samples": manifest.total_samples,
+                }
+                save_latest_training_state_pair(ckpt_dir=ckpt_dir, state=train_state)
+                print(f"  [Ckpt] Updated latest resume checkpoint at epoch {epoch + 1}")
+
+            if dist_ctx.enabled:
+                torch.distributed.barrier()
 
             scheduler.step()
-
-        if is_main_process(dist_ctx):
-            model_to_save = model.module if isinstance(model, DDP) else model
-            export_dir = export_model_bundle(
-                export_root=args.export_dir,
-                run_name=f"{args.train_type}_{run_timestamp}",
-                run_config=vars(args),
-                full_state_dict=model_to_save.state_dict(),
-                encoder_state_dict=model_to_save.encoder.state_dict(),
-                checkpoint_precision=args.checkpoint_dtype,
-                train_log_path=run_dir / "train_log.txt",
-            )
-            print(f"[Export] Bundle exported to: {export_dir}")
     except KeyboardInterrupt:
         if is_main_process(dist_ctx):
             print("[WARN] Training interrupted by user, starting cleanup...")
@@ -854,7 +1077,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data_path", type=str, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--load_mode", type=str, default="eager", choices=("eager", "lazy"))
     parser.add_argument("--save_dir", type=str, default="./outputs/ckpt")
-    parser.add_argument("--export_dir", type=str, default="./outputs/exports")
+    parser.add_argument("--resume_dir", type=str, default=None)
 
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--num_workers", type=int, default=4)
@@ -895,8 +1118,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--precision", type=str, default="bf16")
     parser.add_argument("--checkpoint_dtype", type=str, default="bf16")
 
-    parser.add_argument("--save_every", type=int, default=20)
-    parser.add_argument("--viz_every", type=int, default=1)
+    parser.add_argument("--eval_every", type=int, default=20)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--max_train_steps", type=int, default=0)
     parser.add_argument("--max_val_steps", type=int, default=0)

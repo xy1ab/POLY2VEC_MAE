@@ -5,16 +5,16 @@ source /home/xiaoyang/miniconda3/etc/profile.d/conda.sh
 
 conda activate p2v
 
-cd /home/xiaoyang/workspace/poly2vec_mae_v1/mae_pretrain
+cd /home/xiaoyang/workspace/poly2vec_mae/mae_pretrain
 ```
 
 ### 1 预训练启动
 
 - 入口脚本：`scripts/run_pretrain.py`
   
-- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；支持用 `--viz_every` 控制 PNG 可视化输出间隔（按 epoch）。
+- 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；训练输出统一写入 `<save_dir>/<run_timestamp>/best` 与 `ckpt`；支持用 `--resume_dir` 从既有 run 目录续训。
   
-- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--viz_every` 默认 `1`（每个 epoch 输出），例如 `10` 表示每 10 个 epoch 输出一次。
+- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。
   
 - 调取示例：
   
@@ -34,7 +34,18 @@ python scripts/run_pretrain.py \
 
   --mask_ratio 0.75 \
 
-  --viz_every 10
+  --eval_every 10
+```
+
+- 续训示例：
+
+```bash
+python scripts/run_pretrain.py \
+  --resume_dir ./outputs/ckpt/20260331_1911 \
+  --epochs 200 \
+  --gpu 0,1 \
+  --num_workers 8 \
+  --eval_every 5
 ```
 
 ### 2 模型重建可视化评估

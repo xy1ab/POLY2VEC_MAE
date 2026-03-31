@@ -1,12 +1,11 @@
 # DDP smoke 配置：用于单机多卡功能验证，不用于正式训练。
-# 目标：快速验证 DDP 进程拉起、训练循环、checkpoint/export 正常。
+# 目标：快速验证 DDP 进程拉起、训练循环、best/ckpt 输出与续训断点正常。
 
 train_type: mae
 geom_type: polygon
 
 data_path: ./data/processed/polygon_triangles_smoke.pt
 save_dir: ./outputs/ckpt
-export_dir: ./outputs/exports
 
 # 仅用 2 卡进行 DDP 验证，减少对线上资源影响。
 gpu: "0,1"
@@ -48,5 +47,5 @@ augment_times: 1
 precision: bf16
 checkpoint_dtype: bf16
 
-save_every: 1
+eval_every: 1
 log_interval: 1
