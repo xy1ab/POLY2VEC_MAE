@@ -27,18 +27,23 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from datasets.collate import mae_collate_fn
-from datasets.polygon_dataset import PolyMAEDataset
-from datasets.registry import get_geometry_codec
-from losses.recon_mag_phase import compute_mag_phase_losses
-from models.mae import MaskedAutoencoderViTPoly
-from utils.checkpoint import export_model_bundle, save_checkpoint
-from utils.dist_musa import DistContext, all_reduce_mean, cleanup_distributed, init_distributed_musa, is_main_process
-from utils.filesystem import make_timestamped_dir
-from utils.logger import attach_tee_stdout
-from utils.precision_musa import autocast_context, build_grad_scaler, normalize_precision
-from utils.safe_load import register_numpy_safe_globals
-from utils.seed import set_global_seed
+from ..datasets.collate import mae_collate_fn
+from ..datasets.pt_manifest import PtShardManifest
+from ..datasets.registry import get_geometry_codec
+from ..datasets.sharded_pt_dataset import (
+    EagerShardedPolyDataset,
+    LazyShardedPolyDataset,
+    load_all_samples_from_manifest,
+)
+from ..losses.recon_mag_phase import compute_mag_phase_losses
+from ..models.mae import MaskedAutoencoderViTPoly
+from ..utils.checkpoint import export_model_bundle, save_checkpoint
+from ..utils.dist_musa import DistContext, all_reduce_mean, cleanup_distributed, init_distributed_musa, is_main_process
+from ..utils.filesystem import make_timestamped_dir
+from ..utils.logger import attach_tee_stdout
+from ..utils.precision_musa import autocast_context, build_grad_scaler, normalize_precision
+from ..utils.safe_load import register_numpy_safe_globals
+from ..utils.seed import set_global_seed
 
 
 def patchify(imgs: torch.Tensor, patch_size: int) -> torch.Tensor:
@@ -308,45 +313,125 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
     return model
 
 
-def _split_dataset(full_data_list: list, val_ratio: float, split_seed: int) -> tuple[list, list]:
-    """Split list dataset into train/validation subsets.
+def _resolve_training_pt_files(args) -> list[Path]:
+    """Resolve training shard files from directory input or compatibility path.
 
     Args:
-        full_data_list: Full sample list.
+        args: Parsed training arguments namespace.
+
+    Returns:
+        Sorted absolute `.pt` shard paths.
+    """
+    data_dir = getattr(args, "data_dir", None)
+    if data_dir:
+        data_dir = Path(str(data_dir)).expanduser().resolve()
+        if not data_dir.is_dir():
+            raise NotADirectoryError(f"Training data directory does not exist: {data_dir}")
+        pt_files = sorted(path for path in data_dir.glob("*.pt") if path.is_file())
+        if not pt_files:
+            raise FileNotFoundError(f"No .pt files found under training data directory: {data_dir}")
+        return pt_files
+
+    data_path = getattr(args, "data_path", None)
+    if data_path:
+        resolved = Path(str(data_path)).expanduser().resolve()
+        if resolved.is_file():
+            return [resolved]
+        if resolved.is_dir():
+            pt_files = sorted(path for path in resolved.glob("*.pt") if path.is_file())
+            if pt_files:
+                return pt_files
+
+    raise ValueError("Training data source is missing. Please provide --data_dir.")
+
+
+def _split_dataset_indices(total_size: int, val_ratio: float, split_seed: int) -> tuple[list[int], list[int]]:
+    """Split global sample indices into train/validation subsets.
+
+    Args:
+        total_size: Total number of samples in the manifest.
         val_ratio: Validation ratio.
         split_seed: Random seed for split reproducibility.
 
     Returns:
-        Tuple `(train_data_list, val_data_list)`.
+        Tuple `(train_indices, val_indices)`.
     """
-    total_size = len(full_data_list)
-    val_size = max(1, int(total_size * val_ratio))
+    if total_size < 2:
+        raise ValueError("Training requires at least two samples to build train/val splits.")
+
+    val_size = min(total_size - 1, max(1, int(total_size * val_ratio)))
     train_size = total_size - val_size
 
     generator = torch.Generator().manual_seed(split_seed)
     indices = torch.randperm(total_size, generator=generator).tolist()
     train_indices = indices[:train_size]
     val_indices = indices[train_size:]
-
-    train_data_list = [full_data_list[i] for i in train_indices]
-    val_data_list = [full_data_list[i] for i in val_indices]
-    return train_data_list, val_data_list
+    return train_indices, val_indices
 
 
-def _build_loaders(args, train_data_list: list, val_data_list: list, dist_ctx: DistContext):
-    """Build train/validation dataloaders.
+def _build_datasets(args, manifest: PtShardManifest, dist_ctx: DistContext):
+    """Build train/validation datasets for eager or lazy loading.
+
+    Args:
+        args: Parsed training arguments.
+        manifest: Manifest of all training shard files.
+        dist_ctx: Distributed context.
+
+    Returns:
+        Tuple `(train_dataset, val_dataset, cache_shards)`.
+    """
+    train_indices, val_indices = _split_dataset_indices(
+        total_size=manifest.total_samples,
+        val_ratio=args.val_ratio,
+        split_seed=args.split_seed,
+    )
+
+    if args.load_mode == "eager":
+        all_samples = load_all_samples_from_manifest(manifest)
+        train_dataset = EagerShardedPolyDataset(
+            all_samples=all_samples,
+            sample_indices=train_indices,
+            augment_times=args.augment_times,
+        )
+        val_dataset = EagerShardedPolyDataset(
+            all_samples=all_samples,
+            sample_indices=val_indices,
+            augment_times=1,
+        )
+        return train_dataset, val_dataset, None
+
+    max_cached_shards = manifest.recommend_cache_shards(
+        world_size=dist_ctx.world_size,
+        num_workers=args.num_workers,
+    )
+    train_dataset = LazyShardedPolyDataset(
+        manifest=manifest,
+        sample_indices=train_indices,
+        augment_times=args.augment_times,
+        max_cached_shards=max_cached_shards,
+    )
+    val_dataset = LazyShardedPolyDataset(
+        manifest=manifest,
+        sample_indices=val_indices,
+        augment_times=1,
+        max_cached_shards=max_cached_shards,
+    )
+    return train_dataset, val_dataset, max_cached_shards
+
+
+def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
+    """Build train/validation dataloaders from prepared datasets.
 
     Args:
         args: Parsed training args.
-        train_data_list: Training samples.
-        val_data_list: Validation samples.
+        train_dataset: Training dataset object.
+        val_dataset: Validation dataset object.
         dist_ctx: Distributed context.
 
     Returns:
         Tuple `(train_dataset, val_dataset, train_loader, val_loader, train_sampler)`.
     """
-    train_dataset = PolyMAEDataset(train_data_list, augment_times=args.augment_times)
-    val_dataset = PolyMAEDataset(val_data_list, augment_times=1)
+    persistent_workers = bool(args.num_workers > 0 and args.load_mode == "lazy")
 
     if dist_ctx.enabled:
         train_sampler = DistributedSampler(train_dataset)
@@ -359,6 +444,7 @@ def _build_loaders(args, train_data_list: list, val_data_list: list, dist_ctx: D
             collate_fn=mae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=persistent_workers,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -367,6 +453,7 @@ def _build_loaders(args, train_data_list: list, val_data_list: list, dist_ctx: D
             collate_fn=mae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=persistent_workers,
         )
     else:
         train_sampler = None
@@ -377,6 +464,7 @@ def _build_loaders(args, train_data_list: list, val_data_list: list, dist_ctx: D
             collate_fn=mae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=persistent_workers,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -385,6 +473,7 @@ def _build_loaders(args, train_data_list: list, val_data_list: list, dist_ctx: D
             collate_fn=mae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
+            persistent_workers=persistent_workers,
         )
 
     return train_dataset, val_dataset, train_loader, val_loader, train_sampler
@@ -402,7 +491,7 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
     Returns:
         Tuple `(fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig)`.
     """
-    fixed_tris_orig = val_dataset.data_list[0]
+    fixed_tris_orig = val_dataset.get_base_sample(0)
     random.seed(args.split_seed)
     np.random.seed(args.split_seed)
 
@@ -509,13 +598,26 @@ def train_main(args) -> None:
             eta_min=args.min_lr,
         )
 
-    full_data_list = torch.load(args.data_path, weights_only=False)
-    train_data_list, val_data_list = _split_dataset(full_data_list, val_ratio=args.val_ratio, split_seed=args.split_seed)
+    args.load_mode = str(args.load_mode).lower()
+    pt_files = _resolve_training_pt_files(args)
+    manifest = PtShardManifest.from_pt_files(pt_files)
+    train_dataset, val_dataset, cache_shards = _build_datasets(args, manifest, dist_ctx)
+
+    if is_main_process(dist_ctx):
+        total_size_mb = manifest.total_size_bytes / (1024.0 * 1024.0)
+        print(
+            "[INFO] Data pipeline   : "
+            f"mode={args.load_mode}, shards={manifest.num_shards}, "
+            f"samples={manifest.total_samples}, size={total_size_mb:.2f} MB"
+        )
+        print(f"[INFO] Data directory  : {pt_files[0].parent}")
+        if cache_shards is not None:
+            print(f"[INFO] Lazy cache     : max_cached_shards={cache_shards} per dataset instance")
 
     train_dataset, val_dataset, train_loader, val_loader, train_sampler = _build_loaders(
         args,
-        train_data_list,
-        val_data_list,
+        train_dataset,
+        val_dataset,
         dist_ctx,
     )
 
@@ -727,7 +829,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--train_type", type=str, default="mae")
     parser.add_argument("--geom_type", type=str, default="polygon")
 
-    parser.add_argument("--data_path", type=str, default="./data/processed/polygon_triangles_normalized.pt")
+    parser.add_argument("--data_dir", type=str, default="./data/processed/hangzhou")
+    parser.add_argument("--data_path", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--load_mode", type=str, default="eager", choices=("eager", "lazy"))
     parser.add_argument("--save_dir", type=str, default="./outputs/ckpt")
     parser.add_argument("--export_dir", type=str, default="./outputs/exports")
 

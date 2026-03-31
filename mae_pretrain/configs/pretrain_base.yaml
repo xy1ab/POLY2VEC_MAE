@@ -12,8 +12,10 @@ geom_type: polygon
 # =========================
 # 数据与输出路径
 # =========================
-# 预处理后的训练数据（torch 保存的三角形列表）。
-data_path: ./data/processed/polygon_triangles_normalized.pt
+# 预处理后的训练数据目录；脚本会自动扫描其中所有 `.pt` 分片。
+data_dir: ./data/processed/hangzhou
+# 数据读取策略：`eager` 表示一次性全部载入内存，`lazy` 表示按 shard 按需读取。
+load_mode: eager
 # 训练检查点输出目录（会自动创建时间戳子目录）。
 save_dir: ./outputs/ckpt
 # 导出模型包目录（encoder 导出时使用）。

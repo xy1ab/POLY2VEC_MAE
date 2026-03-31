@@ -17,7 +17,7 @@ import torch.nn as nn
 from shapely.geometry import Polygon
 import triangle as tr
 
-from datasets.geometry_codec_base import GeometryCodec
+from .geometry_codec_base import GeometryCodec
 
 
 def complex_mul(a_real: torch.Tensor, a_imag: torch.Tensor, b_real: torch.Tensor, b_imag: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

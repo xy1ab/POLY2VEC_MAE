@@ -13,20 +13,33 @@ import argparse
 import sys
 from pathlib import Path
 
-from runtime_bootstrap import ensure_cuda_runtime_libs
+if __package__ in {None, ""}:
+    _CURRENT_DIR = Path(__file__).resolve().parent
+    _PROJECT_ROOT = _CURRENT_DIR.parent
+    _REPO_ROOT = _PROJECT_ROOT.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
+    import importlib
+
+    ensure_cuda_runtime_libs = importlib.import_module(
+        "mae_pretrain.scripts.runtime_bootstrap"
+    ).ensure_cuda_runtime_libs
+else:
+    from .runtime_bootstrap import ensure_cuda_runtime_libs
 
 
-def _inject_src_path() -> Path:
-    """Inject local `src` directory into `sys.path`.
+def _inject_repo_root() -> Path:
+    """Inject repository root into `sys.path` for direct script execution.
 
     Returns:
-        Project root path.
+        `mae_pretrain` project root path.
     """
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
+    repo_root = project_root.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     return project_root
 
 
@@ -153,16 +166,47 @@ def _extract_explicit_cli_keys(argv_tokens: list[str]) -> set[str]:
 def main() -> None:
     """CLI main function for model-aware MAE evaluation."""
     ensure_cuda_runtime_libs()
-    project_root = _inject_src_path()
+    project_root = _inject_repo_root()
 
     import torch
-    from datasets.registry import get_geometry_codec
-    from engine.trainer import mag_phase_to_real_imag, plot_reconstruction, rasterize_tris_to_grid
-    from models.factory import load_mae_model
-    from utils.config import load_yaml_config
-    from utils.filesystem import ensure_dir
-    from utils.precision import autocast_context, normalize_precision
-    from utils.safe_load import register_numpy_safe_globals
+
+    if __package__ in {None, ""}:
+        import importlib
+
+        get_geometry_codec = importlib.import_module(
+            "mae_pretrain.src.datasets.registry"
+        ).get_geometry_codec
+        trainer_module = importlib.import_module("mae_pretrain.src.engine.trainer")
+        mag_phase_to_real_imag = trainer_module.mag_phase_to_real_imag
+        plot_reconstruction = trainer_module.plot_reconstruction
+        rasterize_tris_to_grid = trainer_module.rasterize_tris_to_grid
+        load_mae_model = importlib.import_module(
+            "mae_pretrain.src.models.factory"
+        ).load_mae_model
+        load_yaml_config = importlib.import_module(
+            "mae_pretrain.src.utils.config"
+        ).load_yaml_config
+        ensure_dir = importlib.import_module(
+            "mae_pretrain.src.utils.filesystem"
+        ).ensure_dir
+        precision_module = importlib.import_module("mae_pretrain.src.utils.precision")
+        autocast_context = precision_module.autocast_context
+        normalize_precision = precision_module.normalize_precision
+        register_numpy_safe_globals = importlib.import_module(
+            "mae_pretrain.src.utils.safe_load"
+        ).register_numpy_safe_globals
+    else:
+        from ..src.datasets.registry import get_geometry_codec
+        from ..src.engine.trainer import (
+            mag_phase_to_real_imag,
+            plot_reconstruction,
+            rasterize_tris_to_grid,
+        )
+        from ..src.models.factory import load_mae_model
+        from ..src.utils.config import load_yaml_config
+        from ..src.utils.filesystem import ensure_dir
+        from ..src.utils.precision import autocast_context, normalize_precision
+        from ..src.utils.safe_load import register_numpy_safe_globals
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument(

@@ -17,17 +17,17 @@ from pathlib import Path
 # from runtime_bootstrap import ensure_cuda_runtime_libs
 
 
-def _inject_src_path() -> Path:
-    """Inject local `src` directory into `sys.path`.
+def _inject_repo_root() -> Path:
+    """Inject repository root into `sys.path` for direct script execution.
 
     Returns:
-        Project root path.
+        `mae_pretrain` project root path.
     """
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
+    repo_root = project_root.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     return project_root
 
 
@@ -171,10 +171,18 @@ def _run_torchrun_with_signal_guard(cmd: list[str], env: dict[str, str]) -> int:
 def main() -> None:
     """CLI main function for MAE pretraining launch."""
     # ensure_cuda_runtime_libs()
-    project_root = _inject_src_path()
+    project_root = _inject_repo_root()
 
-    from engine.trainer_musa import run_cli
-    from utils.config import load_yaml_config
+    if __package__ in {None, ""}:
+        import importlib
+
+        run_cli = importlib.import_module("mae_pretrain.src.engine.trainer_musa").run_cli
+        load_yaml_config = importlib.import_module(
+            "mae_pretrain.src.utils.config"
+        ).load_yaml_config
+    else:
+        from ..src.engine.trainer_musa import run_cli
+        from ..src.utils.config import load_yaml_config
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument(

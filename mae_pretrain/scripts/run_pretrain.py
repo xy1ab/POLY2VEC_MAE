@@ -14,20 +14,33 @@ import sys
 import time
 from pathlib import Path
 
-from runtime_bootstrap import ensure_cuda_runtime_libs
+if __package__ in {None, ""}:
+    _CURRENT_DIR = Path(__file__).resolve().parent
+    _PROJECT_ROOT = _CURRENT_DIR.parent
+    _REPO_ROOT = _PROJECT_ROOT.parent
+    if str(_REPO_ROOT) not in sys.path:
+        sys.path.insert(0, str(_REPO_ROOT))
+
+    import importlib
+
+    ensure_cuda_runtime_libs = importlib.import_module(
+        "mae_pretrain.scripts.runtime_bootstrap"
+    ).ensure_cuda_runtime_libs
+else:
+    from .runtime_bootstrap import ensure_cuda_runtime_libs
 
 
-def _inject_src_path() -> Path:
-    """Inject local `src` directory into `sys.path`.
+def _inject_repo_root() -> Path:
+    """Inject repository root into `sys.path` for direct script execution.
 
     Returns:
-        Project root path.
+        `mae_pretrain` project root path.
     """
     current_dir = Path(__file__).resolve().parent
     project_root = current_dir.parent
-    src_root = project_root / "src"
-    if str(src_root) not in sys.path:
-        sys.path.insert(0, str(src_root))
+    repo_root = project_root.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     return project_root
 
 
@@ -170,10 +183,18 @@ def _run_torchrun_with_signal_guard(cmd: list[str], env: dict[str, str]) -> int:
 def main() -> None:
     """CLI main function for MAE pretraining launch."""
     ensure_cuda_runtime_libs()
-    project_root = _inject_src_path()
+    project_root = _inject_repo_root()
 
-    from engine.trainer import run_cli
-    from utils.config import load_yaml_config
+    if __package__ in {None, ""}:
+        import importlib
+
+        run_cli = importlib.import_module("mae_pretrain.src.engine.trainer").run_cli
+        load_yaml_config = importlib.import_module(
+            "mae_pretrain.src.utils.config"
+        ).load_yaml_config
+    else:
+        from ..src.engine.trainer import run_cli
+        from ..src.utils.config import load_yaml_config
 
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument(
