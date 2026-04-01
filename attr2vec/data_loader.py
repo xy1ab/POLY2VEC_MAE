@@ -25,7 +25,7 @@ def load_and_preprocess_gdb(gdb_path, layer_name, cache_path="data_cache.pt"):
             os.remove(cache_path)
 
     print(f"\n🚀 [之江实验室] 正在解析 GDB 并执行全要素强制脱毒与无损压缩...")
-    gdf = gpd.read_file(gdb_path, layer=layer_name, engine="pyogrio", use_arrow=True)
+    gdf = gpd.read_file(gdb_path, layer=layer_name, engine="pyogrio")
     df = pd.DataFrame(gdf).drop(columns=['geometry'], errors='ignore')
     
     # 暴力清除所有空白字符
