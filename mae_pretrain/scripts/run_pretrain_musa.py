@@ -137,7 +137,7 @@ def _is_musa_available() -> bool:
     try:
         import torch_musa  # noqa: F401
         import torch
-
+        torch.backends.mudnn.allow_tf32 = True
         return bool(torch.musa.is_available())
     except Exception:
         return False
