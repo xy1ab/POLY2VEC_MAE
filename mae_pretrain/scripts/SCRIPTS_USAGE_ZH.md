@@ -109,7 +109,15 @@ python scripts/run_export.py \
   当前 row 级严格过滤标准为：某个 part 只要 `part.is_valid == False` 或存在 `shell-hole-touching`，就会被直接过滤；不会再尝试 `buffer(0)`、`make_valid`、`split/shrink touching holes` 等修补。若某一行过滤后没有任何可用 part，或某个保留 part 三角剖分失败/超时/退化过滤后为空，则整行记为 `dropped`。  
   当 `file_type=shp` 时，分块命名为 `<shpfilename>_tri_part_<xxxx>.pt`（例如 `hangzhou_tri_part_0001.pt`）。  
   当使用 `--log` 时，日志默认保存到同一目录，命名为 `<shpfilename>_tri.triangulation_log.json`。  
-  运行摘要中的 `triangulated / dropped / degenerated` 现在都按 `row` 统计：`triangulated + dropped = 总行数`，而 `degenerated` 是 `triangulated` 的子集，表示该行在处理过程中发生过 part 过滤或三角形过滤，但最终仍成功输出。
+  运行摘要中的 `triangulated / dropped / degenerated` 现在都按 `row` 统计：`triangulated + dropped = 总行数`，而 `degenerated` 是 `triangulated` 的子集，表示该行在处理过程中发生过 part 过滤或三角形过滤，但最终仍成功输出。  
+  同时，终端摘要还会额外打印两组 row 画像统计：  
+  `MultiPolygon rows`：`total / triangulated / dropped`；  
+  `Hole rows`：`total / triangulated / dropped`。  
+  对应的 JSON 日志里也会增加这些字段：`multipolygon_rows`、`triangulated_multipolygon_rows`、`dropped_multipolygon_rows`、`hole_rows`、`triangulated_hole_rows`、`dropped_hole_rows`。  
+  此外，日志 JSON 里还会新增两组明细记录：  
+  `multipolygon_row_records`：所有 `MultiPolygon` row 的记录；  
+  `hole_row_records`：所有带孔 row 的记录。  
+  每条记录会包含 `row_idx`、`geom_type`、`is_multipolygon`、`raw_part_count`、`has_holes`、`parts_with_holes`、`total_hole_count`、`max_part_hole_count`、`safe_mode`、`isolated`、`status`、`drop_reason`、`degenerated`、`filtered_part_count`、`filtered_triangle_count`、`kept_triangle_count`，便于后续针对多部件图斑和带孔图斑做定向排查。
   
 - 调取示例：
   

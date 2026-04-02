@@ -46,6 +46,18 @@ _PLOT_COLORS = [
     "#ff9da6",
     "#9d755d",
 ]
+_GEOM_PANEL_PAD_RATIO = 0.03
+_NORM_PANEL_PAD_RATIO = 1.03
+
+
+def _compactify_axis(ax) -> None:
+    """Reduce non-data whitespace inside one subplot."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.tick_params(length=0)
+    for spine in ax.spines.values():
+        spine.set_linewidth(0.8)
+        spine.set_color("#9ca3af")
 
 
 def _inject_repo_root() -> Path:
@@ -610,10 +622,11 @@ def _plot_geometry_panel(
         maxy = max(poly.bounds[3] for poly in geoms)
         dx = max(maxx - minx, 1e-9)
         dy = max(maxy - miny, 1e-9)
-        pad_x = dx * 0.08
-        pad_y = dy * 0.08
+        pad_x = max(dx * _GEOM_PANEL_PAD_RATIO, 1e-9)
+        pad_y = max(dy * _GEOM_PANEL_PAD_RATIO, 1e-9)
         ax.set_xlim(minx - pad_x, maxx + pad_x)
         ax.set_ylim(miny - pad_y, maxy + pad_y)
+    _compactify_axis(ax)
 
 
 def _plot_normalized_parts_panel(ax, part_infos: list[dict[str, Any]], title: str, norm_max: float) -> None:
@@ -626,9 +639,10 @@ def _plot_normalized_parts_panel(ax, part_infos: list[dict[str, Any]], title: st
         dtype=np.float64,
     )
     ax.plot(square[:, 0], square[:, 1], "--", color="#d90429", linewidth=1.0, alpha=0.85)
-    pad = max(float(norm_max) * 1.15, 1e-3)
+    pad = max(float(norm_max) * _NORM_PANEL_PAD_RATIO, 1e-3)
     ax.set_xlim(-pad, pad)
     ax.set_ylim(-pad, pad)
+    _compactify_axis(ax)
 
 
 def _plot_filtered_parts_panel(ax, part_infos: list[dict[str, Any]], title: str, norm_max: float) -> None:
@@ -660,9 +674,10 @@ def _plot_filtered_parts_panel(ax, part_infos: list[dict[str, Any]], title: str,
         dtype=np.float64,
     )
     ax.plot(square[:, 0], square[:, 1], "--", color="#d90429", linewidth=1.0, alpha=0.85)
-    pad = max(float(norm_max) * 1.15, 1e-3)
+    pad = max(float(norm_max) * _NORM_PANEL_PAD_RATIO, 1e-3)
     ax.set_xlim(-pad, pad)
     ax.set_ylim(-pad, pad)
+    _compactify_axis(ax)
 
 
 def _build_triangle_segments(tris: np.ndarray) -> np.ndarray:
@@ -693,7 +708,7 @@ def _plot_triangle_panel(
         dtype=np.float64,
     )
     ax.plot(square[:, 0], square[:, 1], "--", color="#d90429", linewidth=1.0, alpha=0.85)
-    pad = max(float(norm_max) * 1.15, 1e-3)
+    pad = max(float(norm_max) * _NORM_PANEL_PAD_RATIO, 1e-3)
     ax.set_xlim(-pad, pad)
     ax.set_ylim(-pad, pad)
 
@@ -735,6 +750,7 @@ def _plot_triangle_panel(
             transform=ax.transAxes,
             bbox={"facecolor": "white", "alpha": 0.85, "edgecolor": "#d1d5db", "pad": 2.0},
         )
+    _compactify_axis(ax)
 
 
 def _format_multiline_json(data: dict[str, Any]) -> str:
@@ -745,6 +761,75 @@ def _format_multiline_json(data: dict[str, Any]) -> str:
             lines.append(f"{key}: {json.dumps(_to_jsonable(value), ensure_ascii=False)}")
         else:
             lines.append(f"{key}: {value}")
+    return "\n".join(lines)
+
+
+def _format_info_panel_text(info_payload: dict[str, Any], part_summary_payload: dict[str, Any]) -> str:
+    """Build a concise text block for the right-side overview panel.
+
+    The PNG should prioritize geometry panels over verbose metadata. We therefore
+    keep the on-figure text concise, while the companion JSON file still stores
+    the complete payload.
+    """
+    selected = info_payload.get("selected_part_summary") or {}
+    lines: list[str] = [
+        "Row Overview",
+        f"row_index: {info_payload.get('row_index')}",
+        f"part_index: {info_payload.get('part_index')} (requested={info_payload.get('requested_part_index')})",
+        f"polygon_type: {info_payload.get('polygon_type')}",
+        f"raw_part_count: {info_payload.get('raw_part_count')}",
+        f"normalized_part_count: {info_payload.get('normalized_part_count')}",
+        f"filtered_part_count: {info_payload.get('filtered_part_count')}",
+        f"kept_part_count: {info_payload.get('kept_part_count')}",
+        "",
+        "Execution",
+        f"safe_mode: {info_payload.get('safe_mode')}",
+        f"build_would_isolate_row: {info_payload.get('build_would_isolate_row')}",
+        f"triangulation_status: {info_payload.get('triangulation_status')}",
+        f"failure_stage: {info_payload.get('failure_stage')}",
+        f"row_degenerated: {info_payload.get('row_degenerated')}",
+        f"status_note: {info_payload.get('status_note')}",
+        "",
+        "Thresholds",
+        f"part_safe: {info_payload.get('part_safe')}",
+        f"node_safe: {info_payload.get('node_safe')}",
+        f"hole_safe: {info_payload.get('hole_safe')}",
+        f"edge_safe: {info_payload.get('edge_safe')}",
+        f"timeout_safe: {info_payload.get('timeout_safe')}",
+        f"norm_max: {info_payload.get('norm_max')}",
+        f"min_triangle_area: {info_payload.get('min_triangle_area')}",
+        f"min_triangle_height: {info_payload.get('min_triangle_height')}",
+        "",
+        "Selected Part",
+        f"filtered: {selected.get('filtered')}",
+        f"filter_reason: {selected.get('filter_reason')}",
+        f"is_valid: {selected.get('is_valid')}",
+        f"shell_hole_touching: {selected.get('shell_hole_touching')}",
+        f"hole_count: {selected.get('hole_count')}",
+        f"node_count: {selected.get('node_count')}",
+        f"min_edge: {selected.get('min_edge')}",
+        "",
+        "Part Statuses",
+    ]
+
+    part_statuses = list(part_summary_payload.get("part_statuses", []))
+    max_lines = 12
+    for idx, part in enumerate(part_statuses[:max_lines], start=1):
+        lines.append(
+            "P{part_index}: filtered={filtered}, reason={reason}, valid={valid}, "
+            "touch={touch}, holes={holes}, nodes={nodes}, min_edge={edge}".format(
+                part_index=part.get("part_index"),
+                filtered=part.get("filtered"),
+                reason=part.get("filter_reason"),
+                valid=part.get("is_valid"),
+                touch=part.get("shell_hole_touching"),
+                holes=part.get("hole_count"),
+                nodes=part.get("node_count"),
+                edge=part.get("min_edge"),
+            )
+        )
+    if len(part_statuses) > max_lines:
+        lines.append(f"... {len(part_statuses) - max_lines} more parts omitted in PNG; see JSON for full details")
     return "\n".join(lines)
 
 
@@ -918,51 +1003,59 @@ def main() -> None:
         ]
     }
 
-    fig, axes = plt.subplots(2, 4, figsize=(24, 10))
-    _plot_geometry_panel(axes[0, 0], list(row_eval["expanded_parts"]), title="Raw Row Geometry", annotate_ids=True)
-    _plot_geometry_panel(axes[0, 1], [target["selected_poly"]], title="Selected Raw Part", annotate_ids=False)
-    _plot_normalized_parts_panel(axes[0, 2], row_eval["part_infos"], title="Row-Normalized Parts", norm_max=float(args.norm_max))
-    _plot_filtered_parts_panel(axes[0, 3], row_eval["part_infos"], title="Filtered Parts", norm_max=float(args.norm_max))
+    figure_text = _format_info_panel_text(info_payload, part_summary_payload)
+
+    fig = plt.figure(figsize=(25, 12), constrained_layout=True)
+    fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+    gs = fig.add_gridspec(
+        2,
+        4,
+        width_ratios=[1.12, 1.12, 1.12, 0.92],
+        height_ratios=[1.0, 1.0],
+        wspace=0.04,
+        hspace=0.06,
+    )
+    ax_raw_row = fig.add_subplot(gs[0, 0])
+    ax_selected = fig.add_subplot(gs[0, 1])
+    ax_norm = fig.add_subplot(gs[0, 2])
+    ax_filtered = fig.add_subplot(gs[1, 0])
+    ax_raw_tri = fig.add_subplot(gs[1, 1])
+    ax_filtered_tri = fig.add_subplot(gs[1, 2])
+    ax_info = fig.add_subplot(gs[:, 3])
+
+    _plot_geometry_panel(ax_raw_row, list(row_eval["expanded_parts"]), title="Raw Row Geometry", annotate_ids=True)
+    _plot_geometry_panel(ax_selected, [target["selected_poly"]], title="Selected Raw Part", annotate_ids=False)
+    _plot_normalized_parts_panel(ax_norm, row_eval["part_infos"], title="Row-Normalized Parts", norm_max=float(args.norm_max))
+    _plot_filtered_parts_panel(ax_filtered, row_eval["part_infos"], title="Filtered Parts", norm_max=float(args.norm_max))
 
     _plot_triangle_panel(
-        axes[1, 0],
+        ax_raw_tri,
         raw_triangle_groups,
         title="Raw Triangulation",
         norm_max=float(args.norm_max),
         status_text=str(row_eval["status_note"]),
     )
     _plot_triangle_panel(
-        axes[1, 1],
+        ax_filtered_tri,
         filtered_triangle_groups,
         title="Filtered Triangulation",
         norm_max=float(args.norm_max),
         status_text=str(row_eval["status_note"]),
     )
-    axes[1, 2].axis("off")
-    axes[1, 2].text(
+    ax_info.axis("off")
+    ax_info.set_title("Overview", fontsize=13, loc="left", pad=10)
+    ax_info.text(
         0.0,
         1.0,
-        _format_multiline_json(part_summary_payload),
+        figure_text,
         va="top",
         ha="left",
-        fontsize=8.2,
-        family="monospace",
-        wrap=True,
-    )
-    axes[1, 3].axis("off")
-    axes[1, 3].text(
-        0.0,
-        1.0,
-        _format_multiline_json(info_payload),
-        va="top",
-        ha="left",
-        fontsize=8.2,
+        fontsize=8.8,
         family="monospace",
         wrap=True,
     )
 
-    fig.suptitle(f"Row Triangulation Visualization: {file_stem}", fontsize=14)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.suptitle(f"Row Triangulation Visualization: {file_stem}", fontsize=16)
 
     png_path = output_dir / f"{file_stem}.png"
     json_path = output_dir / f"{file_stem}.json"

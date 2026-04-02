@@ -381,6 +381,80 @@ def _polygon_min_edge(poly: Polygon) -> float:
     return float(min_edge)
 
 
+def _summarize_row_geometry(geom) -> dict[str, Any]:
+    """Build row-level geometry summary for logging and statistics.
+
+    Args:
+        geom: Raw shapely geometry from one source row.
+
+    Returns:
+        Summary dictionary describing the row before normalization/filtering.
+    """
+    if geom is None or geom.is_empty or geom.geom_type not in {"Polygon", "MultiPolygon"}:
+        return {
+            "geom_type": getattr(geom, "geom_type", None),
+            "is_multipolygon": False,
+            "raw_part_count": 0,
+            "has_holes": False,
+            "parts_with_holes": 0,
+            "total_hole_count": 0,
+            "max_part_hole_count": 0,
+        }
+
+    polygon_parts = _expand_geometry_to_polygons(geom)
+    hole_counts = [int(len(poly.interiors)) for poly, _ in polygon_parts]
+    total_hole_count = int(sum(hole_counts))
+    return {
+        "geom_type": str(geom.geom_type),
+        "is_multipolygon": bool(geom.geom_type == "MultiPolygon"),
+        "raw_part_count": int(len(polygon_parts)),
+        "has_holes": bool(total_hole_count > 0),
+        "parts_with_holes": int(sum(1 for count in hole_counts if count > 0)),
+        "total_hole_count": total_hole_count,
+        "max_part_hole_count": int(max(hole_counts) if hole_counts else 0),
+    }
+
+
+def _build_special_row_log_record(
+    *,
+    file_path: str,
+    layer_name: str | None,
+    source_type: str,
+    row_idx: int,
+    profile: dict[str, Any],
+    safe_mode: str,
+    isolated: bool,
+    status: str,
+    drop_reason: str,
+    filtered_part_count: int,
+    filtered_triangle_count: int,
+    kept_triangle_count: int,
+    degenerated: bool,
+) -> dict[str, Any]:
+    """Build one detailed row log record for MultiPolygon / hole rows."""
+    return {
+        "file_path": str(file_path),
+        "layer_name": layer_name,
+        "source_type": str(source_type),
+        "row_idx": int(row_idx),
+        "geom_type": profile.get("geom_type"),
+        "is_multipolygon": bool(profile.get("is_multipolygon", False)),
+        "raw_part_count": int(profile.get("raw_part_count", 0)),
+        "has_holes": bool(profile.get("has_holes", False)),
+        "parts_with_holes": int(profile.get("parts_with_holes", 0)),
+        "total_hole_count": int(profile.get("total_hole_count", 0)),
+        "max_part_hole_count": int(profile.get("max_part_hole_count", 0)),
+        "safe_mode": str(safe_mode),
+        "isolated": bool(isolated),
+        "status": str(status),
+        "drop_reason": str(drop_reason),
+        "degenerated": bool(degenerated),
+        "filtered_part_count": int(filtered_part_count),
+        "filtered_triangle_count": int(filtered_triangle_count),
+        "kept_triangle_count": int(kept_triangle_count),
+    }
+
+
 def _filter_row_parts(normalized_parts: list[Polygon]) -> tuple[list[Polygon], int]:
     """Filter row parts using strict validity and shell-hole-touching rules."""
     kept_parts: list[Polygon] = []
@@ -1110,7 +1184,15 @@ def _init_result_counters() -> dict[str, Any]:
         "degenerate_row_count": 0,
         "dropped_row_count": 0,
         "isolated_row_count": 0,
+        "multipolygon_row_count": 0,
+        "hole_row_count": 0,
+        "triangulated_multipolygon_row_count": 0,
+        "triangulated_hole_row_count": 0,
+        "dropped_multipolygon_row_count": 0,
+        "dropped_hole_row_count": 0,
         "degenerate_records": [],
+        "multipolygon_records": [],
+        "hole_records": [],
     }
 
 
@@ -1127,7 +1209,15 @@ def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> N
     target["degenerate_row_count"] += int(partial.get("degenerate_row_count", 0))
     target["dropped_row_count"] += int(partial.get("dropped_row_count", 0))
     target["isolated_row_count"] += int(partial.get("isolated_row_count", 0))
+    target["multipolygon_row_count"] += int(partial.get("multipolygon_row_count", 0))
+    target["hole_row_count"] += int(partial.get("hole_row_count", 0))
+    target["triangulated_multipolygon_row_count"] += int(partial.get("triangulated_multipolygon_row_count", 0))
+    target["triangulated_hole_row_count"] += int(partial.get("triangulated_hole_row_count", 0))
+    target["dropped_multipolygon_row_count"] += int(partial.get("dropped_multipolygon_row_count", 0))
+    target["dropped_hole_row_count"] += int(partial.get("dropped_hole_row_count", 0))
     target["degenerate_records"].extend(list(partial.get("degenerate_records", [])))
+    target["multipolygon_records"].extend(list(partial.get("multipolygon_records", [])))
+    target["hole_records"].extend(list(partial.get("hole_records", [])))
 
 
 def _count_geometry_samples(geom) -> int:
@@ -1192,9 +1282,58 @@ def _triangulate_row_geometry(
         row_out["dropped_row_count"] = 1
         return row_out
 
+    row_profile = _summarize_row_geometry(geom)
+    is_multipolygon = bool(row_profile["is_multipolygon"])
+    has_holes = bool(row_profile["has_holes"])
+    row_out["multipolygon_row_count"] = int(is_multipolygon)
+    row_out["hole_row_count"] = int(has_holes)
+
+    def append_special_log(
+        *,
+        status: str,
+        drop_reason: str,
+        isolated: bool,
+        filtered_part_count: int,
+        filtered_triangle_count: int,
+        kept_triangle_count: int,
+        degenerated: bool,
+    ) -> None:
+        if not enable_log:
+            return
+        record = _build_special_row_log_record(
+            file_path=file_path,
+            layer_name=layer_name,
+            source_type=source_type,
+            row_idx=int(row_idx),
+            profile=row_profile,
+            safe_mode=str(safe_mode),
+            isolated=bool(isolated),
+            status=str(status),
+            drop_reason=str(drop_reason),
+            filtered_part_count=int(filtered_part_count),
+            filtered_triangle_count=int(filtered_triangle_count),
+            kept_triangle_count=int(kept_triangle_count),
+            degenerated=bool(degenerated),
+        )
+        if is_multipolygon:
+            row_out["multipolygon_records"].append(record)
+        if has_holes:
+            row_out["hole_records"].append(record)
+
     normalized_parts = _normalize_row_parts(geom=geom, norm_max=float(norm_max))
     if not normalized_parts:
         row_out["dropped_row_count"] = 1
+        row_out["dropped_multipolygon_row_count"] = int(is_multipolygon)
+        row_out["dropped_hole_row_count"] = int(has_holes)
+        append_special_log(
+            status="dropped",
+            drop_reason="row_normalization_failed",
+            isolated=False,
+            filtered_part_count=0,
+            filtered_triangle_count=0,
+            kept_triangle_count=0,
+            degenerated=False,
+        )
         return row_out
 
     if str(safe_mode).strip().lower() == _SAFE_MODE_ALL:
@@ -1203,6 +1342,17 @@ def _triangulate_row_geometry(
         filtered_parts, _ = _filter_row_parts(normalized_parts)
         if not filtered_parts:
             row_out["dropped_row_count"] = 1
+            row_out["dropped_multipolygon_row_count"] = int(is_multipolygon)
+            row_out["dropped_hole_row_count"] = int(has_holes)
+            append_special_log(
+                status="dropped",
+                drop_reason="all_parts_filtered",
+                isolated=False,
+                filtered_part_count=int(len(normalized_parts)),
+                filtered_triangle_count=0,
+                kept_triangle_count=0,
+                degenerated=False,
+            )
             return row_out
         isolate_row = _should_isolate_row(
             safe_mode=safe_mode,
@@ -1230,11 +1380,33 @@ def _triangulate_row_geometry(
 
     if not bool(row_result.get("ok", False)):
         row_out["dropped_row_count"] = 1
+        row_out["dropped_multipolygon_row_count"] = int(is_multipolygon)
+        row_out["dropped_hole_row_count"] = int(has_holes)
+        append_special_log(
+            status="dropped",
+            drop_reason=str(row_result.get("failure_reason", "unknown_failure")),
+            isolated=bool(isolate_row),
+            filtered_part_count=int(row_result.get("filtered_part_count", 0)),
+            filtered_triangle_count=int(row_result.get("filtered_triangle_count", 0)),
+            kept_triangle_count=0,
+            degenerated=False,
+        )
         return row_out
 
     triangles = row_result.get("triangles")
     if not isinstance(triangles, np.ndarray) or triangles.ndim != 3 or triangles.shape[1:] != (3, 2):
         row_out["dropped_row_count"] = 1
+        row_out["dropped_multipolygon_row_count"] = int(is_multipolygon)
+        row_out["dropped_hole_row_count"] = int(has_holes)
+        append_special_log(
+            status="dropped",
+            drop_reason="invalid_triangle_array",
+            isolated=bool(isolate_row),
+            filtered_part_count=int(row_result.get("filtered_part_count", 0)),
+            filtered_triangle_count=int(row_result.get("filtered_triangle_count", 0)),
+            kept_triangle_count=0,
+            degenerated=False,
+        )
         return row_out
 
     filtered_triangle_count = int(row_result.get("filtered_triangle_count", 0))
@@ -1243,6 +1415,8 @@ def _triangulate_row_geometry(
 
     row_out["triangles"].append(triangles.astype(np.float32))
     row_out["triangulated_output_count"] = 1
+    row_out["triangulated_multipolygon_row_count"] = int(is_multipolygon)
+    row_out["triangulated_hole_row_count"] = int(has_holes)
     if is_degenerated_row:
         row_out["degenerate_row_count"] = 1
         if enable_log:
@@ -1252,6 +1426,13 @@ def _triangulate_row_geometry(
                     "layer_name": layer_name,
                     "source_type": source_type,
                     "row_idx": int(row_idx),
+                    "geom_type": row_profile.get("geom_type"),
+                    "is_multipolygon": bool(is_multipolygon),
+                    "raw_part_count": int(row_profile.get("raw_part_count", 0)),
+                    "has_holes": bool(has_holes),
+                    "parts_with_holes": int(row_profile.get("parts_with_holes", 0)),
+                    "total_hole_count": int(row_profile.get("total_hole_count", 0)),
+                    "max_part_hole_count": int(row_profile.get("max_part_hole_count", 0)),
                     "safe_mode": str(safe_mode),
                     "isolated": bool(isolate_row),
                     "filtered_part_count": int(row_result.get("filtered_part_count", 0)),
@@ -1259,6 +1440,15 @@ def _triangulate_row_geometry(
                     "kept_triangle_count": int(triangles.shape[0]),
                 }
             )
+    append_special_log(
+        status="triangulated",
+        drop_reason="",
+        isolated=bool(isolate_row),
+        filtered_part_count=int(row_result.get("filtered_part_count", 0)),
+        filtered_triangle_count=int(filtered_triangle_count),
+        kept_triangle_count=int(triangles.shape[0]),
+        degenerated=bool(is_degenerated_row),
+    )
 
     return row_out
 
@@ -1751,7 +1941,15 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
         "degenerate_row_count": int(result.get("degenerate_row_count", 0)),
         "dropped_row_count": int(result.get("dropped_row_count", 0)),
         "isolated_row_count": int(result.get("isolated_row_count", 0)),
+        "multipolygon_row_count": int(result.get("multipolygon_row_count", 0)),
+        "hole_row_count": int(result.get("hole_row_count", 0)),
+        "triangulated_multipolygon_row_count": int(result.get("triangulated_multipolygon_row_count", 0)),
+        "triangulated_hole_row_count": int(result.get("triangulated_hole_row_count", 0)),
+        "dropped_multipolygon_row_count": int(result.get("dropped_multipolygon_row_count", 0)),
+        "dropped_hole_row_count": int(result.get("dropped_hole_row_count", 0)),
         "degenerate_records": list(result.get("degenerate_records", [])),
+        "multipolygon_records": list(result.get("multipolygon_records", [])),
+        "hole_records": list(result.get("hole_records", [])),
     }
 
     if not ok:
@@ -1876,6 +2074,14 @@ def process_and_save(
     dropped_rows = 0
     isolated_rows = 0
     degenerate_log_records: list[dict[str, Any]] = []
+    multipolygon_rows = 0
+    hole_rows = 0
+    triangulated_multipolygon_rows = 0
+    triangulated_hole_rows = 0
+    dropped_multipolygon_rows = 0
+    dropped_hole_rows = 0
+    multipolygon_log_records: list[dict[str, Any]] = []
+    hole_log_records: list[dict[str, Any]] = []
 
     def consume_and_merge(result: dict[str, Any]) -> None:
         """Merge one ordered worker result into global counters and writer.
@@ -1886,6 +2092,9 @@ def process_and_save(
         nonlocal files_ok, files_failed
         nonlocal source_geometries_total, triangulated_total
         nonlocal total_rows, degenerated_rows, dropped_rows, isolated_rows
+        nonlocal multipolygon_rows, hole_rows
+        nonlocal triangulated_multipolygon_rows, triangulated_hole_rows
+        nonlocal dropped_multipolygon_rows, dropped_hole_rows
 
         merged = _consume_worker_result(result, writer)
 
@@ -1898,9 +2107,17 @@ def process_and_save(
         degenerated_rows += int(merged["degenerate_row_count"])
         dropped_rows += int(merged["dropped_row_count"])
         isolated_rows += int(merged["isolated_row_count"])
+        multipolygon_rows += int(merged["multipolygon_row_count"])
+        hole_rows += int(merged["hole_row_count"])
+        triangulated_multipolygon_rows += int(merged["triangulated_multipolygon_row_count"])
+        triangulated_hole_rows += int(merged["triangulated_hole_row_count"])
+        dropped_multipolygon_rows += int(merged["dropped_multipolygon_row_count"])
+        dropped_hole_rows += int(merged["dropped_hole_row_count"])
 
         if log:
             degenerate_log_records.extend(merged["degenerate_records"])
+            multipolygon_log_records.extend(merged["multipolygon_records"])
+            hole_log_records.extend(merged["hole_records"])
 
     with tqdm(total=len(task_list), desc="Triangulating tasks", unit="task") as pbar:
         for task_index, task in enumerate(task_list):
@@ -1957,7 +2174,15 @@ def process_and_save(
             "dropped_rows": int(dropped_rows),
             "degenerated_rows": int(degenerated_rows),
             "isolated_rows": int(isolated_rows),
+            "multipolygon_rows": int(multipolygon_rows),
+            "triangulated_multipolygon_rows": int(triangulated_multipolygon_rows),
+            "dropped_multipolygon_rows": int(dropped_multipolygon_rows),
+            "hole_rows": int(hole_rows),
+            "triangulated_hole_rows": int(triangulated_hole_rows),
+            "dropped_hole_rows": int(dropped_hole_rows),
             "degenerated_row_records": degenerate_log_records,
+            "multipolygon_row_records": multipolygon_log_records,
+            "hole_row_records": hole_log_records,
         }
         with log_path.open("w", encoding="utf-8") as fp:
             json.dump(log_payload, fp, ensure_ascii=False, indent=2)
@@ -1971,6 +2196,14 @@ def process_and_save(
     print(f"[INFO] Dropped rows           : {dropped_rows}")
     print(f"[INFO] Degenerated rows       : {degenerated_rows}")
     print(f"[INFO] Isolated rows          : {isolated_rows}")
+    print(
+        "[INFO] MultiPolygon rows      : "
+        f"total={multipolygon_rows}, triangulated={triangulated_multipolygon_rows}, dropped={dropped_multipolygon_rows}"
+    )
+    print(
+        "[INFO] Hole rows              : "
+        f"total={hole_rows}, triangulated={triangulated_hole_rows}, dropped={dropped_hole_rows}"
+    )
 
     if triangulated_total == 0:
         return
