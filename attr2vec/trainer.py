@@ -9,8 +9,8 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from data_loader import load_and_preprocess_gdb
 from models import NaturalResourceFoundationModel
-
-torch.set_default_dtype(torch.float32)
+import argparse
+# torch.set_default_dtype(torch.float32)
 
 class GDBDataset(Dataset):
     # 🌟 修复：接入最新架构的 4 路数据
@@ -22,7 +22,18 @@ class GDBDataset(Dataset):
     def __len__(self): return len(self.norm)
     def __getitem__(self, idx): return self.norm[idx], self.c_int[idx], self.c_frac[idx], self.cat[idx]
 
-def train():
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="attr2vec 预训练脚本")
+    parser.add_argument("--data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/data/LCXZ_TEST.gdb")
+    parser.add_argument("--layer_name", type=str, default="LCXZ_TEST01_XZ")
+    parser.add_argument("--save_dir", type=str, default="./outputs/attr2vec")
+    return parser
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
     is_distributed = "LOCAL_RANK" in os.environ
 
     if is_distributed:
@@ -43,7 +54,7 @@ def train():
         print("="*115)
     
     # 获取数据
-    data = load_and_preprocess_gdb("/home/xz/myq/NRE2/data/LCXZ_TEST.gdb", "LCXZ_TEST01_XZ")
+    data = load_and_preprocess_gdb(args.data_path, args.layer_name)
     
     # 🌟 修复：提取解耦后的精确张量
     dataset = GDBDataset(
@@ -118,10 +129,10 @@ def train():
             if avg_loss_final < best_loss:
                 best_loss = avg_loss_final
                 state_dict = model.module.state_dict() if is_distributed else model.state_dict()
-                torch.save(state_dict, "natural_resource_0.1B_512dim.pth")
+                torch.save(state_dict, os.path.join(args.save_dir,"natural_resource_0.1B_512dim.pth"))
                 print(f"   🎯 发现更优 Loss ({best_loss:.4f})，权重已保存。")
 
     if is_distributed: dist.destroy_process_group()
 
 if __name__ == "__main__":
-    train()
+    main()
