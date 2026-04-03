@@ -10,7 +10,6 @@ This script performs MAE reconstruction visualization by:
 from __future__ import annotations
 
 import argparse
-import pickle
 import re
 import sys
 from pathlib import Path
@@ -134,48 +133,17 @@ def _resolve_model_paths(
     return checkpoint_candidates[0], cfg_path
 
 
-def _resolve_pt_files(data_dir: str) -> list[Path]:
-    """Resolve sorted shard `.pt` files directly under one data directory."""
-    base = Path(data_dir).expanduser().resolve()
-    if not base.exists() or not base.is_dir():
-        raise FileNotFoundError(f"Data directory does not exist: {base}")
-
-    pt_files = sorted(path.resolve() for path in base.glob("*.pt") if path.is_file())
-    if not pt_files:
-        raise FileNotFoundError(f"No `.pt` files found directly under data_dir: {base}")
-    return pt_files
-
-
-def _load_pt_payload(torch_module, path: Path):
-    """Load one `.pt` payload, supporting torch-save and legacy pickle formats."""
-    try:
-        return torch_module.load(path, map_location="cpu", weights_only=False)
-    except RuntimeError as exc:
-        if "Invalid magic number" not in str(exc):
-            raise
-        with path.open("rb") as fp:
-            return pickle.load(fp)
-
-
-def _load_sample_by_row_index(torch_module, pt_files: list[Path], row_index: int):
-    """Load one sample from sorted shard files using global row index."""
+def _load_sample_by_row_index(manifest, shard_loader, row_index: int):
+    """Load one sample from a manifest-global row index."""
     if row_index < 0:
         raise IndexError(f"`row_index` must be >= 0, got {row_index}")
 
-    total_samples = 0
-    for path in pt_files:
-        shard_data = _load_pt_payload(torch_module, path)
-        if not isinstance(shard_data, list):
-            raise TypeError(f"Shard file must store a Python list: {path}")
-
-        shard_len = len(shard_data)
-        if row_index < total_samples + shard_len:
-            local_index = row_index - total_samples
-            sample = shard_data[local_index]
-            return sample, path, int(local_index), int(total_samples + shard_len), int(total_samples)
-        total_samples += shard_len
-
-    raise IndexError(f"`row_index` out of range: {row_index} not in [0, {total_samples})")
+    shard_id, local_index = manifest.locate_sample(row_index)
+    shard_info = manifest.shards[shard_id]
+    shard_data = shard_loader(shard_info.path)
+    sample = shard_data[local_index]
+    shard_cumulative_end = int(shard_info.start_index + shard_info.num_samples)
+    return sample, shard_info.path, int(local_index), shard_cumulative_end, int(shard_info.start_index)
 
 
 def _build_eval_parser(project_root: Path) -> argparse.ArgumentParser:
@@ -191,7 +159,7 @@ def _build_eval_parser(project_root: Path) -> argparse.ArgumentParser:
 
     parser.add_argument("--model_dir", type=str, required=True, help="Directory containing MAE checkpoint and model config.")
     parser.add_argument("--data_dir", type=str, required=True, help="Directory containing one or more triangle shard `.pt` files.")
-    parser.add_argument("--row_index", type=int, default=0, help="Global row/sample index across sorted shard `.pt` files.")
+    parser.add_argument("--row_index", type=int, default=0, help="Global row/sample index across manifest-managed or fallback-sorted shard `.pt` files.")
     parser.add_argument(
         "--save_dir",
         type=str,
@@ -365,6 +333,12 @@ def main() -> None:
     if __package__ in {None, ""}:
         import importlib
 
+        PtShardManifest = importlib.import_module(
+            "mae_pretrain.src.datasets.pt_manifest"
+        ).PtShardManifest
+        load_triangle_shard = importlib.import_module(
+            "mae_pretrain.src.datasets.shard_io"
+        ).load_triangle_shard
         get_geometry_codec = importlib.import_module(
             "mae_pretrain.src.datasets.registry"
         ).get_geometry_codec
@@ -377,15 +351,13 @@ def main() -> None:
         precision_module = importlib.import_module("mae_pretrain.src.utils.precision")
         autocast_context = precision_module.autocast_context
         normalize_precision = precision_module.normalize_precision
-        register_numpy_safe_globals = importlib.import_module(
-            "mae_pretrain.src.utils.safe_load"
-        ).register_numpy_safe_globals
     else:
+        from ..src.datasets.pt_manifest import PtShardManifest
+        from ..src.datasets.shard_io import load_triangle_shard
         from ..src.datasets.registry import get_geometry_codec
         from ..src.models.factory import load_mae_model
         from ..src.utils.filesystem import ensure_dir
         from ..src.utils.precision import autocast_context, normalize_precision
-        from ..src.utils.safe_load import register_numpy_safe_globals
 
     parser = _build_eval_parser(project_root)
     args = parser.parse_args()
@@ -431,11 +403,10 @@ def main() -> None:
     }
     codec = get_geometry_codec("polygon", codec_cfg, device=str(device))
 
-    register_numpy_safe_globals()
-    pt_files = _resolve_pt_files(args.data_dir)
+    manifest = PtShardManifest.from_data_dir(args.data_dir, warn_fn=lambda message: print(message))
     sample, shard_path, local_index, _shard_cumulative_end, shard_global_start = _load_sample_by_row_index(
-        torch,
-        pt_files,
+        manifest,
+        load_triangle_shard,
         int(args.row_index),
     )
     tris = torch.as_tensor(sample, dtype=torch.float32)
@@ -447,7 +418,7 @@ def main() -> None:
         imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
 
         with autocast_context(device, args.precision):
-            _, _, _, pred_fix, mask_fix = model(imgs_fix, mask_ratio=float(args.mask_ratio))
+            pred_fix, mask_fix = model(imgs_fix, mask_ratio=float(args.mask_ratio))
 
         pred_fix = pred_fix.float()
         mask_fix = mask_fix.float()

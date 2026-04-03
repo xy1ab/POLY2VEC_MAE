@@ -14,7 +14,7 @@ cd /home/xiaoyang/workspace/poly2vec_mae/mae_pretrain
   
 - 具体功能：读取预训练配置并启动 MAE 训练；当 `--gpu` 指定多卡时可自动拉起单机多卡 DDP；支持 `fp32/bf16/fp16`；训练输出统一写入 `<save_dir>/<run_timestamp>/best` 与 `ckpt`；支持用 `--resume_dir` 从既有 run 目录续训。
   
-- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。
+- 配置说明：默认读取 `configs/pretrain_base.yaml`；命令行同名参数覆盖 YAML；未指定参数沿用 YAML。`--eval_every` 控制评测频率；只有评测 epoch 才会输出 val loss、PNG、并更新 `best/` 与 `ckpt/`。当前关键参数会严格校验：`--mask_ratio` 必须在 `[0,1)`，`--val_ratio` 必须在 `(0,1)`，`--augment_times` 必须 `>= 1`；不再对非法值做静默钳制。
   
 - 调取示例：
   
@@ -54,7 +54,7 @@ python scripts/run_pretrain.py \
   
 - 具体功能：加载 `exports` 下的 `encoder_decoder.pth`（enc+dec），对样本做“CFT -> 掩码编码解码 -> 频域重建 -> ICFT可视化”，并输出训练同款布局 PNG。
   
-- 配置说明：默认读取 `configs/eval_default.yaml`；关键参数包括 `model_dir`、`mask_ratio`、`precision`、`save_dir`；默认输出目录 `./outputs/viz`；命令行同名参数覆盖 YAML。
+- 配置说明：不再依赖 YAML。脚本会直接从 `--model_dir` 中自动寻找模型配置和名称中包含 `mae` 或 `encoder_decoder` 的 `.pth` 文件；从 `--data_dir` 中寻找三角剖分 shard。样本定位使用 `--row_index`，语义是“跨 shard 的全局样本序号”。数据目录中若存在且仅存在一个合法 `.manifest.json`，则优先按 manifest 中声明的 shard 顺序取样；若 manifest 缺失、非法或存在多个，则会打印 warning 并退回到当前目录下按文件名排序的 `*.pt`。当前只支持 `torch.save` 生成的 `.pt` shard；旧 pickle shard 不再兼容。`--mask_ratio` 必须在 `[0,1)`。
   
 - 调取示例：
   
@@ -62,11 +62,11 @@ python scripts/run_pretrain.py \
 ```bash
 python scripts/run_eval.py \
 
-  --config configs/eval_default.yaml \
-
   --model_dir ./outputs/exports/mae_20260325_1724 \
 
-  --index 0 \
+  --data_dir ./data/processed/hangzhou \
+
+  --row_index 0 \
 
   --mask_ratio 0.75 \
 
@@ -107,8 +107,8 @@ python scripts/run_export.py \
 - 配置说明：不依赖 YAML，仅使用 CLI 参数；必须传 `--input_dirs`。  
   常用可选参数：`--file_type`（输入类型：`shp/gdb/geojs`，默认 `shp`）、`--layer`（仅 `gdb` 生效，默认 `all`，可指定单层名）、`--output_dir`（输出目录）、`--num_workers`（任务内并行进程数，`<=0` 自动，也兼容 `--num_worker`）、`--rows_per_chunk`（任务内每个分块处理的行数，默认 `2000`）、`--progress_every_chunks`（每合并 N 个分块打印一次摘要，默认 `10`，`<=0` 关闭）、`--shard_size_mb`（分块大小，`>0` 时达到阈值就立即 flush 一个 `_part_xxxx.pt`，避免把全部结果长期堆在内存里）、`--norm_max`（归一化后的最大绝对坐标值，默认 `1.0`，即区间 `[-1,1]`；若设为 `0.8`，则区间为 `[-0.8,0.8]`）、`--min_triangle_area`（最小三角面积阈值，默认 `1e-8`）、`--min_triangle_height`（最小高阈值，默认 `1e-5`）、`--safe_mode`（`all | risky | off`，控制是否将整行处理链放入隔离子进程）、`--part_safe / --node_safe / --hole_safe / --edge_safe / --timeout_safe`（`safe_mode=risky` 时触发隔离的阈值与超时控制）、`--log`（输出 row 级三角剖分日志）。  
   当前 row 级严格过滤标准为：某个 part 只要 `part.is_valid == False` 或存在 `shell-hole-touching`，就会被直接过滤；不会再尝试 `buffer(0)`、`make_valid`、`split/shrink touching holes` 等修补。若某一行过滤后没有任何可用 part，或某个保留 part 三角剖分失败/超时/退化过滤后为空，则整行记为 `dropped`。  
-  当 `file_type=shp` 时，分块命名为 `<shpfilename>_tri_part_<xxxx>.pt`（例如 `hangzhou_tri_part_0001.pt`）。  
-  当使用 `--log` 时，日志默认保存到同一目录，命名为 `<shpfilename>_tri.triangulation_log.json`。  
+  当 `file_type=shp` 时，分块命名为 `<shpfilename>_tri_part_<xxxx>.pt`（例如 `hangzhou_tri_part_0001.pt`）。当 `--shard_size_mb > 0` 时，会在同目录额外写出 `<shpfilename>_tri.manifest.json`，供训练和评估脚本优先按声明顺序读取 shard。
+  当使用 `--log` 时，日志默认保存到同一目录，命名为 `<shpfilename>_tri.triangulation_log.json`。若存在 row 级异常或 chunk 级失败，还会额外写出 `<shpfilename>_tri.row_failures.json`，用于定位失败行。
   运行摘要中的 `triangulated / dropped / degenerated` 现在都按 `row` 统计：`triangulated + dropped = 总行数`，而 `degenerated` 是 `triangulated` 的子集，表示该行在处理过程中发生过 part 过滤或三角形过滤，但最终仍成功输出。  
   同时，终端摘要还会额外打印两组 row 画像统计：  
   `MultiPolygon rows`：`total / triangulated / dropped`；  
