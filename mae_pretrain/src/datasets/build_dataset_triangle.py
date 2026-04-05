@@ -34,6 +34,8 @@ from shapely.ops import polygonize, triangulate as shapely_triangulate, unary_un
 import triangle as tr
 from tqdm import tqdm
 
+from .shard_io import TORCH_SHARD_SERIALIZATION, save_triangle_shard
+
 try:
     from shapely.validation import make_valid as _shapely_make_valid
 except Exception:  # pragma: no cover - compatibility fallback
@@ -49,19 +51,6 @@ _SAFE_MODE_ALL = "all"
 _SAFE_MODE_RISKY = "risky"
 _SAFE_MODE_OFF = "off"
 _SAFE_MODE_CHOICES = (_SAFE_MODE_ALL, _SAFE_MODE_RISKY, _SAFE_MODE_OFF)
-
-
-def _save_samples_torch(samples: list[np.ndarray], output_file: Path) -> None:
-    """Serialize one shard with torch format for downstream compatibility.
-
-    Args:
-        samples: Triangle sample list.
-        output_file: Target output file path.
-    """
-    # Local import avoids triggering torch import during module import phase.
-    import torch
-
-    torch.save(samples, output_file)
 
 
 def _normalize_file_type(file_type: str) -> str:
@@ -452,6 +441,76 @@ def _build_special_row_log_record(
         "filtered_part_count": int(filtered_part_count),
         "filtered_triangle_count": int(filtered_triangle_count),
         "kept_triangle_count": int(kept_triangle_count),
+    }
+
+
+def _safe_row_profile_for_failure(geom) -> dict[str, Any]:
+    """Best-effort geometry summary used when row processing raises unexpectedly."""
+    try:
+        return _summarize_row_geometry(geom)
+    except Exception:
+        return {
+            "geom_type": str(getattr(geom, "geom_type", "<unknown>")),
+            "is_multipolygon": bool(getattr(geom, "geom_type", None) == "MultiPolygon"),
+            "raw_part_count": 0,
+            "has_holes": False,
+            "parts_with_holes": 0,
+            "total_hole_count": 0,
+            "max_part_hole_count": 0,
+        }
+
+
+def _build_failed_row_record(
+    *,
+    file_path: str,
+    layer_name: str | None,
+    source_type: str,
+    row_idx: int,
+    profile: dict[str, Any],
+    error_type: str,
+    error_message: str,
+    sample_count: int,
+) -> dict[str, Any]:
+    """Build one row-level failure record for unexpected exceptions."""
+    return {
+        "file_path": str(file_path),
+        "layer_name": layer_name,
+        "source_type": str(source_type),
+        "row_idx": int(row_idx),
+        "geom_type": profile.get("geom_type"),
+        "is_multipolygon": bool(profile.get("is_multipolygon", False)),
+        "raw_part_count": int(profile.get("raw_part_count", 0)),
+        "has_holes": bool(profile.get("has_holes", False)),
+        "parts_with_holes": int(profile.get("parts_with_holes", 0)),
+        "total_hole_count": int(profile.get("total_hole_count", 0)),
+        "max_part_hole_count": int(profile.get("max_part_hole_count", 0)),
+        "sample_count": int(sample_count),
+        "error_type": str(error_type),
+        "error_message": str(error_message),
+    }
+
+
+def _build_chunk_failure_record(
+    *,
+    chunk_index: int,
+    row_count: int,
+    row_sample_count: int,
+    file_path: str,
+    layer_name: str | None,
+    source_type: str,
+    error_type: str,
+    error_message: str,
+) -> dict[str, Any]:
+    """Build one chunk-level failure record for worker crashes."""
+    return {
+        "chunk_index": int(chunk_index),
+        "file_path": str(file_path),
+        "layer_name": layer_name,
+        "source_type": str(source_type),
+        "row_count": int(row_count),
+        "row_sample_count": int(row_sample_count),
+        "error_type": str(error_type),
+        "error_message": str(error_message),
     }
 
 
@@ -1183,6 +1242,8 @@ def _init_result_counters() -> dict[str, Any]:
         "total_rows": 0,
         "degenerate_row_count": 0,
         "dropped_row_count": 0,
+        "failed_row_count": 0,
+        "failed_sample_count": 0,
         "isolated_row_count": 0,
         "multipolygon_row_count": 0,
         "hole_row_count": 0,
@@ -1190,9 +1251,12 @@ def _init_result_counters() -> dict[str, Any]:
         "triangulated_hole_row_count": 0,
         "dropped_multipolygon_row_count": 0,
         "dropped_hole_row_count": 0,
+        "chunk_failure_count": 0,
         "degenerate_records": [],
         "multipolygon_records": [],
         "hole_records": [],
+        "failed_rows": [],
+        "chunk_failures": [],
     }
 
 
@@ -1208,6 +1272,8 @@ def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> N
     target["total_rows"] += int(partial.get("total_rows", 0))
     target["degenerate_row_count"] += int(partial.get("degenerate_row_count", 0))
     target["dropped_row_count"] += int(partial.get("dropped_row_count", 0))
+    target["failed_row_count"] += int(partial.get("failed_row_count", 0))
+    target["failed_sample_count"] += int(partial.get("failed_sample_count", 0))
     target["isolated_row_count"] += int(partial.get("isolated_row_count", 0))
     target["multipolygon_row_count"] += int(partial.get("multipolygon_row_count", 0))
     target["hole_row_count"] += int(partial.get("hole_row_count", 0))
@@ -1215,9 +1281,12 @@ def _merge_result_counters(target: dict[str, Any], partial: dict[str, Any]) -> N
     target["triangulated_hole_row_count"] += int(partial.get("triangulated_hole_row_count", 0))
     target["dropped_multipolygon_row_count"] += int(partial.get("dropped_multipolygon_row_count", 0))
     target["dropped_hole_row_count"] += int(partial.get("dropped_hole_row_count", 0))
+    target["chunk_failure_count"] += int(partial.get("chunk_failure_count", 0))
     target["degenerate_records"].extend(list(partial.get("degenerate_records", [])))
     target["multipolygon_records"].extend(list(partial.get("multipolygon_records", [])))
     target["hole_records"].extend(list(partial.get("hole_records", [])))
+    target["failed_rows"].extend(list(partial.get("failed_rows", [])))
+    target["chunk_failures"].extend(list(partial.get("chunk_failures", [])))
 
 
 def _count_geometry_samples(geom) -> int:
@@ -1494,8 +1563,8 @@ def _triangulate_chunk_worker(
     """
     chunk_out = _init_result_counters()
     row_sample_count = int(sum(_count_geometry_samples(payload[1]) for payload in row_payloads))
-    try:
-        for row_idx, geom in row_payloads:
+    for row_idx, geom in row_payloads:
+        try:
             row_out = _triangulate_row_geometry(
                 row_idx=int(row_idx),
                 geom=geom,
@@ -1513,16 +1582,33 @@ def _triangulate_chunk_worker(
                 norm_max=float(norm_max),
                 enable_log=enable_log,
             )
-            _merge_result_counters(chunk_out, row_out)
-    except Exception as exc:
-        return {
-            "index": int(chunk_index),
-            "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
-            "row_count": int(len(row_payloads)),
-            "row_sample_count": int(row_sample_count),
-            **_init_result_counters(),
-        }
+        except Exception as exc:
+            row_profile = _safe_row_profile_for_failure(geom)
+            sample_count = int(_count_geometry_samples(geom))
+            is_multipolygon = bool(row_profile.get("is_multipolygon", False))
+            has_holes = bool(row_profile.get("has_holes", False))
+            row_out = _init_result_counters()
+            row_out["total_rows"] = 1
+            row_out["dropped_row_count"] = 1
+            row_out["failed_row_count"] = 1
+            row_out["failed_sample_count"] = int(sample_count)
+            row_out["multipolygon_row_count"] = int(is_multipolygon)
+            row_out["hole_row_count"] = int(has_holes)
+            row_out["dropped_multipolygon_row_count"] = int(is_multipolygon)
+            row_out["dropped_hole_row_count"] = int(has_holes)
+            row_out["failed_rows"].append(
+                _build_failed_row_record(
+                    file_path=file_path,
+                    layer_name=layer_name,
+                    source_type=source_type,
+                    row_idx=int(row_idx),
+                    profile=row_profile,
+                    error_type=type(exc).__name__,
+                    error_message=str(exc),
+                    sample_count=int(sample_count),
+                )
+            )
+        _merge_result_counters(chunk_out, row_out)
 
     return {
         "index": int(chunk_index),
@@ -1531,6 +1617,44 @@ def _triangulate_chunk_worker(
         "row_count": int(len(row_payloads)),
         "row_sample_count": int(row_sample_count),
         **chunk_out,
+    }
+
+
+def _build_chunk_failure_result(
+    *,
+    chunk_index: int,
+    row_count: int,
+    row_sample_count: int,
+    file_path: str,
+    layer_name: str | None,
+    source_type: str,
+    error_type: str,
+    error_message: str,
+) -> dict[str, Any]:
+    """Build one synthetic chunk result when chunk execution itself fails."""
+    failure_out = _init_result_counters()
+    failure_out["total_rows"] = int(row_count)
+    failure_out["dropped_row_count"] = int(row_count)
+    failure_out["chunk_failure_count"] = 1
+    failure_out["chunk_failures"].append(
+        _build_chunk_failure_record(
+            chunk_index=int(chunk_index),
+            row_count=int(row_count),
+            row_sample_count=int(row_sample_count),
+            file_path=file_path,
+            layer_name=layer_name,
+            source_type=source_type,
+            error_type=error_type,
+            error_message=error_message,
+        )
+    )
+    return {
+        "index": int(chunk_index),
+        "ok": False,
+        "error": f"{error_type}: {error_message}",
+        "row_count": int(row_count),
+        "row_sample_count": int(row_sample_count),
+        **failure_out,
     }
 
 
@@ -1635,23 +1759,37 @@ def _triangulate_task_worker(
     with tqdm(total=source_geometry_count, desc=f"Task {task_index + 1}/{task_count} rows", unit="row", leave=False) as row_pbar:
         if chunk_worker_count <= 1:
             for chunk_index, chunk_payload in enumerate(chunks):
-                chunk_result = _triangulate_chunk_worker(
-                    chunk_index=chunk_index,
-                    row_payloads=chunk_payload,
-                    file_path=file_path,
-                    layer_name=layer_name,
-                    source_type=source_type,
-                    min_triangle_area=min_triangle_area,
-                    min_triangle_height=min_triangle_height,
-                    safe_mode=safe_mode,
-                    part_safe=int(part_safe),
-                    node_safe=int(node_safe),
-                    hole_safe=int(hole_safe),
-                    edge_safe=float(edge_safe),
-                    timeout_safe=float(timeout_safe),
-                    norm_max=float(norm_max),
-                    enable_log=enable_log,
-                )
+                chunk_row_count = int(len(chunk_payload))
+                chunk_row_sample_count = int(sum(_count_geometry_samples(p[1]) for p in chunk_payload))
+                try:
+                    chunk_result = _triangulate_chunk_worker(
+                        chunk_index=chunk_index,
+                        row_payloads=chunk_payload,
+                        file_path=file_path,
+                        layer_name=layer_name,
+                        source_type=source_type,
+                        min_triangle_area=min_triangle_area,
+                        min_triangle_height=min_triangle_height,
+                        safe_mode=safe_mode,
+                        part_safe=int(part_safe),
+                        node_safe=int(node_safe),
+                        hole_safe=int(hole_safe),
+                        edge_safe=float(edge_safe),
+                        timeout_safe=float(timeout_safe),
+                        norm_max=float(norm_max),
+                        enable_log=enable_log,
+                    )
+                except Exception as exc:
+                    chunk_result = _build_chunk_failure_result(
+                        chunk_index=chunk_index,
+                        row_count=chunk_row_count,
+                        row_sample_count=chunk_row_sample_count,
+                        file_path=file_path,
+                        layer_name=layer_name,
+                        source_type=source_type,
+                        error_type=type(exc).__name__,
+                        error_message=str(exc),
+                    )
                 row_pbar.update(int(chunk_result.get("row_count", len(chunk_payload))))
 
                 if not bool(chunk_result.get("ok", False)):
@@ -1659,8 +1797,7 @@ def _triangulate_task_worker(
                     tqdm.write(
                         f"[WARN] Chunk failed in {file_path}{layer_suffix}: {chunk_result.get('error', 'unknown error')}"
                     )
-                    task_out["total_rows"] += int(chunk_result.get("row_sample_count", 0))
-                    task_out["dropped_row_count"] += int(chunk_result.get("row_sample_count", 0))
+                    _merge_result_counters(task_out, chunk_result)
                 else:
                     chunk_triangles = list(chunk_result.get("triangles", []))
                     if writer is not None and chunk_triangles:
@@ -1712,14 +1849,16 @@ def _triangulate_task_worker(
                     try:
                         chunk_result = future.result()
                     except Exception as exc:
-                        chunk_result = {
-                            "index": int(chunk_index),
-                            "ok": False,
-                            "error": f"{type(exc).__name__}: {exc}",
-                            "row_count": int(row_count),
-                            "row_sample_count": int(row_sample_count),
-                            **_init_result_counters(),
-                        }
+                        chunk_result = _build_chunk_failure_result(
+                            chunk_index=chunk_index,
+                            row_count=row_count,
+                            row_sample_count=row_sample_count,
+                            file_path=file_path,
+                            layer_name=layer_name,
+                            source_type=source_type,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
 
                     row_pbar.update(int(chunk_result.get("row_count", row_count)))
                     pending_results[int(chunk_result["index"])] = chunk_result
@@ -1732,8 +1871,7 @@ def _triangulate_task_worker(
                                 f"[WARN] Chunk failed in {file_path}{layer_suffix}: "
                                 f"{ordered_chunk.get('error', 'unknown error')}"
                             )
-                            task_out["total_rows"] += int(ordered_chunk.get("row_sample_count", 0))
-                            task_out["dropped_row_count"] += int(ordered_chunk.get("row_sample_count", 0))
+                            _merge_result_counters(task_out, ordered_chunk)
                         else:
                             chunk_triangles = list(ordered_chunk.get("triangles", []))
                             if writer is not None and chunk_triangles:
@@ -1810,6 +1948,11 @@ def _default_log_path(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}.triangulation_log.json")
 
 
+def _default_row_failures_path(output_path: Path) -> Path:
+    """Build default row-failure summary path beside output `.pt` base file."""
+    return output_path.with_name(f"{output_path.stem}.row_failures.json")
+
+
 class _ShardWriter:
     """Incremental writer that flushes samples to `.pt` shards by size estimate."""
 
@@ -1855,10 +1998,9 @@ class _ShardWriter:
         else:
             output_file = self.output_path
 
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-        _save_samples_torch(self._buffer, output_file)
+        written_path = save_triangle_shard(output_file, self._buffer)
 
-        self.shard_paths.append(output_file)
+        self.shard_paths.append(written_path)
         self.shard_sample_counts.append(len(self._buffer))
 
         self._buffer = []
@@ -1881,7 +2023,7 @@ class _ShardWriter:
         manifest_path = self.output_path.with_name(f"{self.output_path.stem}.manifest.json")
         manifest = {
             "base_output_path": str(self.output_path),
-            "serialization": "torch_save_numpy_list",
+            "serialization": TORCH_SHARD_SERIALIZATION,
             "shard_size_mb": self.shard_size_bytes / (1024.0 * 1024.0),
             "num_shards": len(self.shard_paths),
             "total_samples": int(sum(self.shard_sample_counts)),
@@ -1940,6 +2082,8 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
         "total_rows": int(result.get("total_rows", 0)),
         "degenerate_row_count": int(result.get("degenerate_row_count", 0)),
         "dropped_row_count": int(result.get("dropped_row_count", 0)),
+        "failed_row_count": int(result.get("failed_row_count", 0)),
+        "failed_sample_count": int(result.get("failed_sample_count", 0)),
         "isolated_row_count": int(result.get("isolated_row_count", 0)),
         "multipolygon_row_count": int(result.get("multipolygon_row_count", 0)),
         "hole_row_count": int(result.get("hole_row_count", 0)),
@@ -1947,9 +2091,12 @@ def _consume_worker_result(result: dict[str, Any], writer: _ShardWriter) -> dict
         "triangulated_hole_row_count": int(result.get("triangulated_hole_row_count", 0)),
         "dropped_multipolygon_row_count": int(result.get("dropped_multipolygon_row_count", 0)),
         "dropped_hole_row_count": int(result.get("dropped_hole_row_count", 0)),
+        "chunk_failure_count": int(result.get("chunk_failure_count", 0)),
         "degenerate_records": list(result.get("degenerate_records", [])),
         "multipolygon_records": list(result.get("multipolygon_records", [])),
         "hole_records": list(result.get("hole_records", [])),
+        "failed_rows": list(result.get("failed_rows", [])),
+        "chunk_failures": list(result.get("chunk_failures", [])),
     }
 
     if not ok:
@@ -2072,6 +2219,8 @@ def process_and_save(
     total_rows = 0
     degenerated_rows = 0
     dropped_rows = 0
+    failed_rows = 0
+    failed_samples = 0
     isolated_rows = 0
     degenerate_log_records: list[dict[str, Any]] = []
     multipolygon_rows = 0
@@ -2080,8 +2229,11 @@ def process_and_save(
     triangulated_hole_rows = 0
     dropped_multipolygon_rows = 0
     dropped_hole_rows = 0
+    chunk_failures = 0
     multipolygon_log_records: list[dict[str, Any]] = []
     hole_log_records: list[dict[str, Any]] = []
+    failed_row_records: list[dict[str, Any]] = []
+    chunk_failure_records: list[dict[str, Any]] = []
 
     def consume_and_merge(result: dict[str, Any]) -> None:
         """Merge one ordered worker result into global counters and writer.
@@ -2091,10 +2243,11 @@ def process_and_save(
         """
         nonlocal files_ok, files_failed
         nonlocal source_geometries_total, triangulated_total
-        nonlocal total_rows, degenerated_rows, dropped_rows, isolated_rows
+        nonlocal total_rows, degenerated_rows, dropped_rows, failed_rows, failed_samples, isolated_rows
         nonlocal multipolygon_rows, hole_rows
         nonlocal triangulated_multipolygon_rows, triangulated_hole_rows
         nonlocal dropped_multipolygon_rows, dropped_hole_rows
+        nonlocal chunk_failures
 
         merged = _consume_worker_result(result, writer)
 
@@ -2106,6 +2259,8 @@ def process_and_save(
         total_rows += int(merged["total_rows"])
         degenerated_rows += int(merged["degenerate_row_count"])
         dropped_rows += int(merged["dropped_row_count"])
+        failed_rows += int(merged["failed_row_count"])
+        failed_samples += int(merged["failed_sample_count"])
         isolated_rows += int(merged["isolated_row_count"])
         multipolygon_rows += int(merged["multipolygon_row_count"])
         hole_rows += int(merged["hole_row_count"])
@@ -2113,6 +2268,10 @@ def process_and_save(
         triangulated_hole_rows += int(merged["triangulated_hole_row_count"])
         dropped_multipolygon_rows += int(merged["dropped_multipolygon_row_count"])
         dropped_hole_rows += int(merged["dropped_hole_row_count"])
+        chunk_failures += int(merged["chunk_failure_count"])
+
+        failed_row_records.extend(merged["failed_rows"])
+        chunk_failure_records.extend(merged["chunk_failures"])
 
         if log:
             degenerate_log_records.extend(merged["degenerate_records"])
@@ -2154,6 +2313,23 @@ def process_and_save(
         if not shard_paths:
             print("[WARN] No output shard was written.")
 
+    if failed_rows > 0 or chunk_failures > 0:
+        row_failures_path = _default_row_failures_path(output_path)
+        row_failures_payload = {
+            "output_base_path": str(output_path),
+            "input_file_type": canonical_file_type,
+            "input_layer_selector": str(layer),
+            "safe_mode": str(safe_mode),
+            "failed_row_count": int(failed_rows),
+            "failed_sample_count": int(failed_samples),
+            "chunk_failure_count": int(chunk_failures),
+            "failed_rows": failed_row_records,
+            "chunk_failures": chunk_failure_records,
+        }
+        with row_failures_path.open("w", encoding="utf-8") as fp:
+            json.dump(row_failures_payload, fp, ensure_ascii=False, indent=2)
+        print(f"[INFO] Row failure summary    : {row_failures_path}")
+
     if log:
         log_path = _default_log_path(output_path)
         log_payload = {
@@ -2172,6 +2348,9 @@ def process_and_save(
             "total_rows": int(total_rows),
             "triangulated_rows": int(triangulated_total),
             "dropped_rows": int(dropped_rows),
+            "failed_rows": int(failed_rows),
+            "failed_sample_count": int(failed_samples),
+            "chunk_failures": int(chunk_failures),
             "degenerated_rows": int(degenerated_rows),
             "isolated_rows": int(isolated_rows),
             "multipolygon_rows": int(multipolygon_rows),
@@ -2194,6 +2373,8 @@ def process_and_save(
     print(f"[INFO] Total rows              : {total_rows}")
     print(f"[INFO] Triangulated rows       : {triangulated_total}")
     print(f"[INFO] Dropped rows           : {dropped_rows}")
+    print(f"[INFO] Failed rows            : {failed_rows}")
+    print(f"[INFO] Chunk failures         : {chunk_failures}")
     print(f"[INFO] Degenerated rows       : {degenerated_rows}")
     print(f"[INFO] Isolated rows          : {isolated_rows}")
     print(
