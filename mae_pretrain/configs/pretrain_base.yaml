@@ -61,13 +61,17 @@ min_lr: 1.0e-6
 # Polygon 频域参数
 # =========================
 # 频率采样数量（越大表示频域网格越密）。
-pos_freqs: 255
+pos_freqs: 63
 # 最小频率。
 w_min: 0.1
 # 最大频率。
-w_max: 500.0
+w_max: 200.0
 # 频率采样策略（当前支持 geometric）。
 freq_type: geometric
+# CFT 逐三角频域积分的分块大小；过大容易造成 GPU 瞬时显存峰值过高。
+cft_triangle_chunk_size: 256
+# ICFT 空间重建的分块大小；用于避免可视化阶段一次性构造超大 [freq, space] 基函数矩阵。
+icft_spatial_chunk_size: 256
 
 # =========================
 # 模型结构（ViT-MAE）
@@ -94,9 +98,9 @@ dec_num_heads: 2
 # 总训练轮数。
 epochs: 200
 # batch size（按单进程计算，DDP 下为每进程 batch）。
-batch_size: 512
+batch_size: 2048
 # 初始学习率。
-lr: 2.4e-3
+lr: 12e-4
 # AdamW 权重衰减。
 weight_decay: 0.05
 # MAE mask 比例。
@@ -119,6 +123,6 @@ checkpoint_dtype: fp32
 # 保存与日志
 # =========================
 # 每 N 个 epoch 进行一次评测；评测时才会输出 val loss、PNG 与续训断点。
-eval_every: 20
+eval_every: 5
 # 每 N 个 step 打印一次训练日志。
 log_interval: 50

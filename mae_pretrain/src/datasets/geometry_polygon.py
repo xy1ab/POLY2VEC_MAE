@@ -141,6 +141,8 @@ def build_poly_fourier_converter_from_config(config: dict, device: str | torch.d
         w_max=float(config.get("w_max", 100.0)),
         freq_type=str(config.get("freq_type", "geometric")),
         patch_size=int(config.get("patch_size", 2)),
+        triangle_chunk_size=int(config.get("cft_triangle_chunk_size", 2048)),
+        icft_spatial_chunk_size=int(config.get("icft_spatial_chunk_size", 256)),
         device=device,
     )
 
@@ -160,6 +162,8 @@ class PolyFourierConverter(nn.Module):
         freq_type: str = "geometric",
         device: str | torch.device = "cuda",
         patch_size: int = 16,
+        triangle_chunk_size: int = 2048,
+        icft_spatial_chunk_size: int = 256,
     ):
         """Initialize converter and frequency grid buffers."""
         super().__init__()
@@ -169,11 +173,19 @@ class PolyFourierConverter(nn.Module):
         self.freq_type = freq_type
         self.device = torch.device(device)
         self.patch_size = patch_size
+        self.triangle_chunk_size = int(triangle_chunk_size)
+        self.icft_spatial_chunk_size = int(icft_spatial_chunk_size)
 
         if self.pos_freqs < 1:
             raise ValueError(f"`pos_freqs` must be >= 1, got {self.pos_freqs}")
         if self.patch_size < 1:
             raise ValueError(f"`patch_size` must be >= 1, got {self.patch_size}")
+        if self.triangle_chunk_size < 1:
+            raise ValueError(f"`triangle_chunk_size` must be >= 1, got {self.triangle_chunk_size}")
+        if self.icft_spatial_chunk_size < 1:
+            raise ValueError(
+                f"`icft_spatial_chunk_size` must be >= 1, got {self.icft_spatial_chunk_size}"
+            )
         if self.w_max < self.w_min:
             raise ValueError(f"`w_max` must be >= `w_min`, got w_min={self.w_min}, w_max={self.w_max}")
         if self.freq_type == "geometric" and self.w_min <= 0:
@@ -349,7 +361,7 @@ class PolyFourierConverter(nn.Module):
         valid_tris = batch_triangles[valid_mask]
         batch_indices = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(batch_size, max_triangles)[valid_mask]
 
-        chunk_size = 50000
+        chunk_size = int(self.triangle_chunk_size)
         for offset in range(0, valid_tris.shape[0], chunk_size):
             tris_chunk = valid_tris[offset : offset + chunk_size]
             b_idx_chunk = batch_indices[offset : offset + chunk_size]
@@ -427,17 +439,30 @@ class PolyFourierConverter(nn.Module):
         sym_weights = torch.where(v_flat > 1e-6, 2.0, 1.0).unsqueeze(0)
         weights = weights * sym_weights
 
-        phase_mat = 2 * torch.pi * (u_flat.unsqueeze(1) * x_flat.unsqueeze(0) + v_flat.unsqueeze(1) * y_flat.unsqueeze(0))
-        e_real = torch.cos(phase_mat)
-        e_imag = torch.sin(phase_mat)
-
         f_flat_real = f_uv_real.reshape(batch_size, -1) * weights
         f_flat_imag = f_uv_imag.reshape(batch_size, -1) * weights
 
-        # Re((a+ib) @ (c+id)) = a@c - b@d
-        f_recon = (
-            torch.matmul(f_flat_real, e_real) - torch.matmul(f_flat_imag, e_imag)
-        ).reshape(batch_size, spatial_size, spatial_size)
+        # The naive basis matrix has shape [H*W, spatial_size^2]. With the
+        # default 512x256 frequency grid and spatial_size=256 this would be
+        # 8,589,934,592 float32 elements, i.e. exactly 32 GiB for `phase_mat`
+        # alone. We therefore reconstruct the spatial field in chunks.
+        spatial_point_count = int(x_flat.numel())
+        spatial_chunk = int(self.icft_spatial_chunk_size)
+        f_recon_flat = torch.empty((batch_size, spatial_point_count), dtype=torch.float32, device=self.device)
+
+        for offset in range(0, spatial_point_count, spatial_chunk):
+            x_chunk = x_flat[offset : offset + spatial_chunk]
+            y_chunk = y_flat[offset : offset + spatial_chunk]
+            phase_chunk = 2 * torch.pi * (
+                u_flat.unsqueeze(1) * x_chunk.unsqueeze(0) + v_flat.unsqueeze(1) * y_chunk.unsqueeze(0)
+            )
+            e_real = torch.cos(phase_chunk)
+            e_imag = torch.sin(phase_chunk)
+            f_recon_flat[:, offset : offset + spatial_chunk] = (
+                torch.matmul(f_flat_real, e_real) - torch.matmul(f_flat_imag, e_imag)
+            )
+
+        f_recon = f_recon_flat.reshape(batch_size, spatial_size, spatial_size)
 
         f_min = f_recon.amin(dim=(1, 2), keepdim=True)
         f_max = f_recon.amax(dim=(1, 2), keepdim=True)
