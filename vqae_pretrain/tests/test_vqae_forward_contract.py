@@ -12,7 +12,6 @@ def _build_small_model() -> PolyVqAutoencoder:
     """Create a tiny VQAE model suitable for interface tests."""
     return PolyVqAutoencoder(
         img_size=(8, 8),
-        patch_size=2,
         in_chans=3,
         stem_channels=(8,),
         stem_strides=(2,),
@@ -34,14 +33,13 @@ def _build_small_model() -> PolyVqAutoencoder:
 class VqAeForwardContractTest(unittest.TestCase):
     """Public forward and decode contracts for the VQAE model."""
 
-    def test_forward_without_vq_matches_patch_contract(self) -> None:
-        """Warmup path should still emit patch predictions and no discrete indices."""
+    def test_forward_without_vq_emits_full_resolution_reconstruction(self) -> None:
+        """Warmup path should emit full-image reconstructions and no discrete indices."""
         model = _build_small_model()
         imgs = torch.randn(2, 3, 8, 8)
 
         outputs = model(imgs, use_vq=False)
 
-        self.assertEqual(outputs.pred.shape, (2, 16, 12))
         self.assertEqual(outputs.recon_imgs.shape, imgs.shape)
         self.assertIsNone(outputs.indices)
         self.assertFalse(outputs.using_vq)

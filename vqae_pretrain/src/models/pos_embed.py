@@ -10,7 +10,7 @@ import numpy as np
 
 
 def get_2d_sincos_pos_embed(embed_dim: int, grid_size: tuple[int, int], cls_token: bool = False) -> np.ndarray:
-    """Build 2D sin-cos positional embedding for a HxW patch grid.
+    """Build 2D sin-cos positional embedding for a HxW latent token grid.
 
     Args:
         embed_dim: Output embedding dimension.

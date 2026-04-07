@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -21,13 +22,14 @@ def infer_img_size_from_config(config: dict[str, Any]) -> tuple[int, int]:
             return int(img_size[0]), int(img_size[1])
 
     pos_freqs = int(config.get("pos_freqs", 31))
-    patch_size = int(config.get("patch_size", 2))
+    stem_strides = _parse_int_sequence(config.get("stem_strides"), default=(2, 2, 2))
+    align_stride = max(1, math.prod(int(value) for value in stem_strides))
 
     len_h = 2 * pos_freqs + 1
     len_w = pos_freqs + 1
 
-    pad_h = (patch_size - (len_h % patch_size)) % patch_size
-    pad_w = (patch_size - (len_w % patch_size)) % patch_size
+    pad_h = (align_stride - (len_h % align_stride)) % align_stride
+    pad_w = (align_stride - (len_w % align_stride)) % align_stride
     return len_h + pad_h, len_w + pad_w
 
 
@@ -73,7 +75,6 @@ def build_vqae_model_from_config(
 
     model = PolyVqAutoencoder(
         img_size=img_size,
-        patch_size=int(config.get("patch_size", 2)),
         in_chans=int(config.get("in_chans", 3)),
         stem_channels=stem_channels,
         stem_strides=stem_strides,
@@ -124,6 +125,7 @@ def load_vqae_model(
     runtime_config["runtime_precision"] = runtime_precision
     runtime_config["latent_stride"] = int(model.encoder.latent_stride)
     runtime_config["latent_grid_size"] = tuple(int(v) for v in model.encoder.latent_grid_size)
+    runtime_config["num_latent_tokens"] = int(model.encoder.num_latent_tokens)
     return model, runtime_config
 
 
@@ -234,4 +236,5 @@ def load_decoder_from_components(
     runtime_config["runtime_precision"] = runtime_precision
     runtime_config["latent_stride"] = int(model.encoder.latent_stride)
     runtime_config["latent_grid_size"] = tuple(int(v) for v in model.encoder.latent_grid_size)
+    runtime_config["num_latent_tokens"] = int(model.encoder.num_latent_tokens)
     return model, runtime_config

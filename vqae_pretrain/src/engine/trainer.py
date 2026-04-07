@@ -65,7 +65,6 @@ _RESUME_LOCKED_KEYS = {
     "geom_type",
     "data_dir",
     "data_path",
-    "patch_size",
     "stem_channels",
     "stem_strides",
     "embed_dim",
@@ -100,24 +99,6 @@ _RESUME_LOCKED_KEYS = {
 }
 
 
-def patchify(imgs: torch.Tensor, patch_size: int) -> torch.Tensor:
-    """Convert image tensor into flattened patch tokens.
-
-    Args:
-        imgs: Input tensor `[B,C,H,W]`.
-        patch_size: Patch edge length.
-
-    Returns:
-        Patch tensor `[B,L,C*p*p]`.
-    """
-    batch, channels, height, width = imgs.shape
-    h_patch, w_patch = height // patch_size, width // patch_size
-    x = imgs.reshape(shape=(batch, channels, h_patch, patch_size, w_patch, patch_size))
-    x = torch.einsum("nchpwq->nhwcpq", x)
-    x = x.reshape(shape=(batch, h_patch * w_patch, channels * patch_size**2))
-    return x
-
-
 def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert log-magnitude and phase channels into real/imaginary components.
 
@@ -134,16 +115,15 @@ def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[
     return real_part, imag_part
 
 
-def compute_freq_span_patches(converter, patch_size: int, device: torch.device) -> torch.Tensor:
-    """Compute patch-level frequency-span weighting map.
+def compute_freq_span_map(converter, device: torch.device) -> torch.Tensor:
+    """Compute full-image frequency-span weighting map.
 
     Args:
         converter: Polygon Fourier converter instance.
-        patch_size: Patch edge length.
         device: Runtime device.
 
     Returns:
-        Frequency-span weights shaped `[1,L,p*p]`.
+        Frequency-span weights shaped `[1,1,H,W]`.
     """
     h, w = converter.U.shape
     valid_h = h - converter.pad_h
@@ -177,7 +157,7 @@ def compute_freq_span_patches(converter, patch_size: int, device: torch.device) 
     freq_span_map = torch.sqrt(freq_span_map.clamp_min(0.0))
     freq_span_map = freq_span_map / (freq_span_map.mean() + 1e-8)
 
-    return patchify(freq_span_map.unsqueeze(0).unsqueeze(0), patch_size)
+    return freq_span_map.unsqueeze(0).unsqueeze(0)
 
 
 def rasterize_tris_to_grid(tris: torch.Tensor, height: int, width: int) -> np.ndarray:
@@ -321,7 +301,6 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
         "geom_type": args.geom_type,
         "train_type": args.train_type,
         "img_size": img_size,
-        "patch_size": args.patch_size,
         "in_chans": 3,
         "stem_channels": args.stem_channels,
         "stem_strides": args.stem_strides,
@@ -367,7 +346,6 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
     model = build_vqae_model_from_config(
         {
             "img_size": img_size,
-            "patch_size": args.patch_size,
             "in_chans": 3,
             "stem_channels": args.stem_channels,
             "stem_strides": args.stem_strides,
@@ -464,8 +442,6 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`min_lr` must be >= 0, got {args.min_lr}")
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
-    if args.patch_size <= 0:
-        raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
     if args.depth <= 0:
         raise ValueError(f"`depth` must be > 0, got {args.depth}")
     if args.num_heads <= 0:
@@ -1002,17 +978,20 @@ def train_main(args) -> None:
         print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
         print(f"[INFO] ICFT spatial chunk: {converter.icft_spatial_chunk_size}")
 
-    freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
+    freq_span_map = compute_freq_span_map(converter, device=device)
 
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
     model_to_save = model.module if isinstance(model, DDP) else model
     model_config["latent_stride"] = int(model_to_save.encoder.latent_stride)
     model_config["latent_grid_size"] = tuple(int(v) for v in model_to_save.encoder.latent_grid_size)
+    model_config["num_latent_tokens"] = int(model_to_save.encoder.num_latent_tokens)
     run_config["latent_stride"] = model_config["latent_stride"]
     run_config["latent_grid_size"] = model_config["latent_grid_size"]
+    run_config["num_latent_tokens"] = model_config["num_latent_tokens"]
     if is_main_process(dist_ctx):
         print(f"[INFO] Latent stride  : {model_config['latent_stride']}")
         print(f"[INFO] Latent grid    : {model_config['latent_grid_size']}")
+        print(f"[INFO] Latent tokens  : {model_config['num_latent_tokens']}")
         _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     if resume_state is not None:
@@ -1136,15 +1115,13 @@ def train_main(args) -> None:
                 with autocast_context(device, args.precision):
                     outputs = model(imgs, use_vq=use_vq)
 
-                pred = outputs.pred.float()
+                recon_imgs = outputs.recon_imgs.float()
                 vq_loss = outputs.vq_loss.float()
-                target_patches = patchify(imgs, args.patch_size).float()
 
                 loss_mag, loss_phase = compute_mag_phase_losses(
-                    pred=pred,
-                    target_patches=target_patches,
-                    patch_size=args.patch_size,
-                    freq_span_patches=freq_span_patches,
+                    pred_imgs=recon_imgs,
+                    target_imgs=imgs.float(),
+                    freq_span_map=freq_span_map,
                     weight_mag_hf=args.weight_mag_hf,
                 )
                 recon_loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
@@ -1158,8 +1135,7 @@ def train_main(args) -> None:
                         step=step,
                         tensors={
                             "imgs": imgs,
-                            "pred": pred,
-                            "target_patches": target_patches,
+                            "recon_imgs": recon_imgs,
                             "loss_mag": loss_mag,
                             "loss_phase": loss_phase,
                             "loss_vq": vq_loss,
@@ -1219,15 +1195,13 @@ def train_main(args) -> None:
                         with autocast_context(device, args.precision):
                             outputs_v = model(imgs_v, use_vq=use_vq)
 
-                        pred_v = outputs_v.pred.float()
+                        recon_imgs_v = outputs_v.recon_imgs.float()
                         vq_loss_v = outputs_v.vq_loss.float()
-                        target_patches_v = patchify(imgs_v, args.patch_size).float()
 
                         loss_mag_v, loss_phase_v = compute_mag_phase_losses(
-                            pred=pred_v,
-                            target_patches=target_patches_v,
-                            patch_size=args.patch_size,
-                            freq_span_patches=freq_span_patches,
+                            pred_imgs=recon_imgs_v,
+                            target_imgs=imgs_v.float(),
+                            freq_span_map=freq_span_map,
                             weight_mag_hf=args.weight_mag_hf,
                         )
 
@@ -1241,8 +1215,7 @@ def train_main(args) -> None:
                                 step=val_steps,
                                 tensors={
                                     "imgs_val": imgs_v,
-                                    "pred_val": pred_v,
-                                    "target_patches_val": target_patches_v,
+                                    "recon_imgs_val": recon_imgs_v,
                                     "loss_mag_val": loss_mag_v,
                                     "loss_phase_val": loss_phase_v,
                                     "loss_vq_val": vq_loss_v,
@@ -1404,7 +1377,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cft_triangle_chunk_size", type=int, default=2048)
     parser.add_argument("--icft_spatial_chunk_size", type=int, default=256)
 
-    parser.add_argument("--patch_size", type=int, default=4)
     parser.add_argument("--stem_channels", type=str, default="64,128,256")
     parser.add_argument("--stem_strides", type=str, default="2,2,2")
     parser.add_argument("--embed_dim", type=int, default=384)

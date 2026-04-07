@@ -15,7 +15,6 @@ def _build_training_args(**overrides):
         "lr": 1e-3,
         "min_lr": 0.0,
         "batch_size": 8,
-        "patch_size": 4,
         "val_ratio": 0.1,
         "augment_times": 1,
         "warmup_epochs": 5,

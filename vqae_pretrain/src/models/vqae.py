@@ -28,7 +28,6 @@ class ChannelLayerNorm2d(nn.Module):
 class VqAeForwardOutput:
     """Structured VQAE forward result."""
 
-    pred: torch.Tensor
     recon_imgs: torch.Tensor
     vq_loss: torch.Tensor
     perplexity: torch.Tensor
@@ -43,7 +42,6 @@ class PolyVqAutoencoder(nn.Module):
     def __init__(
         self,
         img_size: tuple[int, int] = (31, 31),
-        patch_size: int = 2,
         in_chans: int = 3,
         stem_channels: Sequence[int] = (64, 128, 256),
         stem_strides: Sequence[int] = (2, 2, 2),
@@ -70,7 +68,6 @@ class PolyVqAutoencoder(nn.Module):
     ) -> None:
         super().__init__()
         self.img_size = (int(img_size[0]), int(img_size[1]))
-        self.patch_size = int(patch_size)
         self.in_chans = int(in_chans)
         self.embed_dim = int(embed_dim)
         self.code_dim = int(code_dim)
@@ -143,20 +140,6 @@ class PolyVqAutoencoder(nn.Module):
         """Initialize the EMA codebook from one set of latent vectors."""
         self.quantizer.initialize_codebook(vectors=vectors, num_iters=num_iters)
 
-    def patchify(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Convert reconstructed images into flattened patch predictions."""
-        batch, channels, height, width = imgs.shape
-        patch_size = self.patch_size
-        if height % patch_size != 0 or width % patch_size != 0:
-            raise ValueError(
-                f"Image size {height}x{width} must be divisible by patch_size={patch_size}"
-            )
-        h_patch, w_patch = height // patch_size, width // patch_size
-        x = imgs.reshape(batch, channels, h_patch, patch_size, w_patch, patch_size)
-        x = torch.einsum("nchpwq->nhwcpq", x)
-        x = x.reshape(batch, h_patch * w_patch, channels * patch_size**2)
-        return x
-
     def forward_image(self, imgs: torch.Tensor, use_vq: bool = True) -> VqAeForwardOutput:
         """Run full-image VQAE forward pass.
 
@@ -182,7 +165,6 @@ class PolyVqAutoencoder(nn.Module):
 
         recon_imgs = self.decode_from_code_features(decoded_features)
         return VqAeForwardOutput(
-            pred=self.patchify(recon_imgs),
             recon_imgs=recon_imgs,
             vq_loss=vq_loss,
             perplexity=perplexity,

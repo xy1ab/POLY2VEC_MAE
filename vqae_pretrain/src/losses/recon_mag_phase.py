@@ -10,45 +10,38 @@ import torch
 
 
 def compute_mag_phase_losses(
-    pred: torch.Tensor,
-    target_patches: torch.Tensor,
-    patch_size: int,
-    freq_span_patches: torch.Tensor,
+    pred_imgs: torch.Tensor,
+    target_imgs: torch.Tensor,
+    freq_span_map: torch.Tensor,
     weight_mag_hf: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute VQAE magnitude and phase losses on all patch tokens.
+    """Compute VQAE magnitude and phase losses on full frequency images.
 
     Args:
-        pred: VQAE predicted patches `[B,L,3*p*p]`.
-        target_patches: Ground-truth patches `[B,L,3*p*p]`.
-        patch_size: Patch edge length.
-        freq_span_patches: Frequency-area weight map `[1,L,p*p]`.
+        pred_imgs: VQAE reconstructed frequency images `[B,3,H,W]`.
+        target_imgs: Ground-truth frequency images `[B,3,H,W]`.
+        freq_span_map: Frequency-area weight map `[1,1,H,W]`.
         weight_mag_hf: Weight for high-frequency magnitude penalty.
 
     Returns:
         Tuple `(loss_mag, loss_phase)`.
     """
-    p2 = patch_size**2
+    target_mag = target_imgs[:, 0:1]
+    target_cos = target_imgs[:, 1:2]
+    target_sin = target_imgs[:, 2:3]
 
-    target_mag = target_patches[:, :, :p2]
-    target_cos = target_patches[:, :, p2 : 2 * p2]
-    target_sin = target_patches[:, :, 2 * p2 :]
-
-    pred_mag = pred[:, :, :p2]
-    pred_cos = pred[:, :, p2 : 2 * p2]
-    pred_sin = pred[:, :, 2 * p2 :]
-
-    patch_weights = torch.ones(pred.shape[:2], device=pred.device, dtype=pred.dtype)
-    weight_denom = patch_weights.sum() + 1e-8
+    pred_mag = pred_imgs[:, 0:1]
+    pred_cos = pred_imgs[:, 1:2]
+    pred_sin = pred_imgs[:, 2:3]
 
     mag_l1 = torch.abs(pred_mag - target_mag)
-    loss_mag_base = (mag_l1.mean(dim=-1) * patch_weights).sum() / weight_denom
+    loss_mag_base = mag_l1.mean()
 
-    weighted_mag = mag_l1 * freq_span_patches
-    loss_mag_penalty = (weighted_mag.mean(dim=-1) * patch_weights).sum() / weight_denom
+    weighted_mag = mag_l1 * freq_span_map
+    loss_mag_penalty = weighted_mag.mean()
     loss_mag = loss_mag_base + weight_mag_hf * loss_mag_penalty
 
     phase_l1 = torch.abs(pred_cos - target_cos) + torch.abs(pred_sin - target_sin)
-    loss_phase = (phase_l1.mean(dim=-1) * patch_weights).sum() / weight_denom
+    loss_phase = phase_l1.mean()
 
     return loss_mag, loss_phase

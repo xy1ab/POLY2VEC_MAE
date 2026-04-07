@@ -131,12 +131,12 @@ class PolyEncoder(nn.Module):
             )
 
         self.latent_grid_size = (latent_h, latent_w)
-        self.num_patches = latent_h * latent_w
+        self.num_latent_tokens = latent_h * latent_w
         self.latent_stride = self.stem.output_stride
 
         self.token_proj = nn.Conv2d(self.stem.out_channels, self.embed_dim, kernel_size=1, bias=True)
         self.token_drop = nn.Dropout(self.drop_rate)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, self.embed_dim), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_latent_tokens, self.embed_dim), requires_grad=False)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -184,9 +184,9 @@ class PolyEncoder(nn.Module):
         batch_size, channels, height, width = x.shape
 
         tokens = x.flatten(2).transpose(1, 2)
-        if tokens.shape[1] != self.num_patches:
+        if tokens.shape[1] != self.num_latent_tokens:
             raise RuntimeError(
-                f"Unexpected latent token count {tokens.shape[1]} != {self.num_patches}. "
+                f"Unexpected latent token count {tokens.shape[1]} != {self.num_latent_tokens}. "
                 f"Got feature map {height}x{width} for img_size={self.img_size}"
             )
 

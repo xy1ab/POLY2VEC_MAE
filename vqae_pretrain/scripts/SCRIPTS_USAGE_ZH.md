@@ -12,6 +12,11 @@ cd /home/xiaoyang/workspace/poly2vec_mae/vqae_pretrain
 
 - 具体功能：读取 `configs/pretrain_base.yaml` 与命令行覆盖参数，启动 `conv+ViT encoder + EMA VQ + attention+conv decoder` 的 VQAE 训练。训练输出统一写到 `<save_dir>/<run_timestamp>/best` 与 `ckpt`。支持 `--resume_dir` 从同一次 run 目录继续训练。
 
+- 当前实现说明：
+  - encoder token 数由 `stem_strides` 的总下采样倍率决定，不再使用 patchify 作为 token 化入口；
+  - 训练损失直接对完整频域图 `Mag/Cos/Sin` 计算，不再使用 patch-based loss；
+  - 输入频域图会自动 padding 到 `latent_stride` 的整数倍。
+
 - warmup 机制：
   - `warmup_epochs`：学习率 warmup，从训练开始即生效。
   - `vq_warmup_epochs`：VQ warmup。在这段时期内完全按连续 AE 训练，不启用 quantizer。
