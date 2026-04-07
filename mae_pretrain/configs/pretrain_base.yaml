@@ -15,7 +15,7 @@ geom_type: polygon
 # 预处理后的训练数据目录；脚本会自动扫描其中所有 `.pt` 分片。
 data_dir: ./data/processed/hangzhou
 # 数据读取策略：`eager` 表示一次性全部载入内存，`lazy` 表示按 shard 按需读取。
-load_mode: lazy
+load_mode: eager
 # 训练输出根目录；脚本会自动创建 `<save_dir>/<run_timestamp>/best` 和 `ckpt`。
 save_dir: ./outputs/ckpt
 
@@ -53,7 +53,7 @@ weight_phase: 1.0
 # 验证集比例（从训练集中切分）。
 val_ratio: 0.05
 # warmup 轮数；设为 0 表示不 warmup。
-warmup_epochs: 30
+warmup_epochs: 20
 # 学习率下界（cosine 退火最小值）。
 min_lr: 1.0e-6
 
@@ -61,11 +61,11 @@ min_lr: 1.0e-6
 # Polygon 频域参数
 # =========================
 # 频率采样数量（越大表示频域网格越密）。
-pos_freqs: 63
+pos_freqs: 255
 # 最小频率。
 w_min: 0.1
 # 最大频率。
-w_max: 250.0
+w_max: 500.0
 # 频率采样策略（当前支持 geometric）。
 freq_type: geometric
 
@@ -73,26 +73,26 @@ freq_type: geometric
 # 模型结构（ViT-MAE）
 # =========================
 # patch 边长，需与频域网格尺寸匹配。
-patch_size: 4
+patch_size: 32
 # 编码器 token 维度。
-embed_dim: 512
+embed_dim: 32
 # 编码器层数。
-depth: 24
+depth: 12
 # 编码器注意力头数。
-num_heads: 8
+num_heads: 1
 
 # 解码器 token 维度。
-dec_embed_dim: 256
+dec_embed_dim: 64
 # 解码器层数。
 dec_depth: 8
 # 解码器注意力头数。
-dec_num_heads: 4
+dec_num_heads: 2
 
 # =========================
 # 训练超参数
 # =========================
 # 总训练轮数。
-epochs: 500
+epochs: 200
 # batch size（按单进程计算，DDP 下为每进程 batch）。
 batch_size: 512
 # 初始学习率。
@@ -100,9 +100,11 @@ lr: 2.4e-3
 # AdamW 权重衰减。
 weight_decay: 0.05
 # MAE mask 比例。
-mask_ratio: 0.75
+mask_ratio: 0.1
+# 损失模式：`full` 为全图重构损失，`mask` 为原 MAE 的 masked-only 损失。
+loss_mode: full
 # 数据增强重复次数（仅训练集）。
-augment_times: 5
+augment_times: 10
 
 # =========================
 # 精度策略
