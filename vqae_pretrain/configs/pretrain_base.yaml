@@ -1,0 +1,128 @@
+# VQAE 预训练默认配置（polygon 版本）。
+# 该文件中的字段会直接映射到 `src/engine/trainer.py` 参数。
+
+# =========================
+# 任务与几何类型
+# =========================
+train_type: vqae
+geom_type: polygon
+
+# =========================
+# 数据与输出路径
+# =========================
+data_dir: ./data/processed/hangzhou
+load_mode: eager
+save_dir: ./outputs/ckpt
+
+# =========================
+# 运行环境
+# =========================
+gpu: "0"
+num_workers: 4
+
+# =========================
+# 复现性
+# =========================
+seed: 42
+split_seed: 42
+deterministic: false
+
+# =========================
+# 损失项权重
+# =========================
+weight_mag: 1.0
+weight_mag_hf: 1.0
+weight_phase: 1.0
+
+# =========================
+# 优化与 warmup
+# =========================
+val_ratio: 0.05
+# 学习率 warmup 轮数。该 warmup 从训练开始即生效，可与 VQ warmup 重合。
+warmup_epochs: 20
+# VQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 quantizer。
+vq_warmup_epochs: 10
+# VQ beta warmup 轮数。它在 VQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
+vq_beta_warmup_epochs: 5
+min_lr: 1.0e-6
+
+# =========================
+# Polygon 频域参数
+# =========================
+pos_freqs: 63
+w_min: 0.1
+w_max: 200.0
+freq_type: geometric
+cft_triangle_chunk_size: 256
+icft_spatial_chunk_size: 256
+
+# =========================
+# 编码器（Conv + ViT）
+# =========================
+patch_size: 32
+stem_channels: "64,128,256"
+stem_strides: "2,2,2"
+embed_dim: 256
+depth: 8
+num_heads: 8
+mlp_ratio: 4.0
+drop_rate: 0.0
+drop_path_rate: 0.0
+
+# =========================
+# 解码器（多 stage attention + conv）
+# =========================
+decoder_stage_channels: "256,192,128"
+decoder_attention_type: window
+decoder_attention_heads: "8,4,4"
+decoder_attention_depths: "1,1,0"
+decoder_conv_depths: "2,2,2"
+decoder_window_size: 8
+decoder_upsample_mode: bilinear
+decoder_mlp_ratio: 4.0
+decoder_drop_rate: 0.0
+
+# =========================
+# VQ 参数
+# =========================
+# 码本容量。越大表示离散表示越细，但越难训练，也更容易出现低利用率。
+codebook_size: 8192
+# 量化空间维度。通常建议小于等于 embed_dim，例如 embed_dim=256, code_dim=128。
+code_dim: 128
+# VQ commitment loss 的目标权重。过大会加重量化约束并放大量化噪声。
+vq_beta: 0.25
+# EMA 更新衰减系数。
+# 设置思路：
+# - 0.95 ~ 0.98: 更新更快，但波动更大；
+# - 0.99: 默认推荐，稳定性与适应速度较平衡；
+# - 0.995 ~ 0.999: 更稳，但需要更多训练 step 才能让 codebook 充分适应数据。
+vq_decay: 0.99
+# EMA 数值稳定项，用于 cluster_size 归一化时避免除零。
+vq_eps: 1.0e-5
+# 死码阈值；低于该 EMA 使用计数的 code 会被当前 batch 的 latent 特征重置。
+vq_dead_code_threshold: 1.0
+# VQ 初始化时最多采样多少个 latent 向量参与工程版 K-means。
+vq_init_max_vectors: 100000
+# 工程版 K-means 的迭代轮数。
+vq_kmeans_iters: 10
+
+# =========================
+# 训练超参数
+# =========================
+epochs: 200
+batch_size: 512
+lr: 2.0e-3
+weight_decay: 0.05
+augment_times: 10
+
+# =========================
+# 精度策略
+# =========================
+precision: bf16
+checkpoint_dtype: fp32
+
+# =========================
+# 保存与日志
+# =========================
+eval_every: 5
+log_interval: 50

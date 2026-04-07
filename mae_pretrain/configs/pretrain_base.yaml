@@ -41,7 +41,7 @@ deterministic: false
 # 损失项权重
 # =========================
 # 频域幅值损失权重。
-weight_mag: 1.0
+weight_mag: 5.0
 # 高频区域幅值损失附加权重。
 weight_mag_hf: 1.0
 # 相位损失权重。
@@ -77,20 +77,20 @@ icft_spatial_chunk_size: 256
 # 模型结构（ViT-MAE）
 # =========================
 # patch 边长，需与频域网格尺寸匹配。
-patch_size: 16
+patch_size: 8
 # 编码器 token 维度。
-embed_dim: 256
+embed_dim: 128
 # 编码器层数。
 depth: 8
 # 编码器注意力头数。
-num_heads: 4
+num_heads: 2
 
 # 解码器 token 维度。
-dec_embed_dim: 512
+dec_embed_dim: 256
 # 解码器层数。
 dec_depth: 16
 # 解码器注意力头数。
-dec_num_heads: 8
+dec_num_heads: 4
 
 # =========================
 # 训练超参数
