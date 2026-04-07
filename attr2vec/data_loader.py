@@ -6,11 +6,11 @@ import torch
 import os
 import json
 import warnings
+import glob
 
 warnings.filterwarnings('ignore')
 
 class NRE_DataPump:
-    # 🌟 核心升级 1：将最大文本截断长度彻底解封至 64
     def __init__(self, vocab_path='global_vocab_auto.json', max_seq_len=64):
         self.vocab_path = vocab_path
         self.max_seq_len = max_seq_len
@@ -55,7 +55,6 @@ class NRE_DataPump:
             
             cont_mantissa, cont_exponent = np.frexp(raw_64)
             
-            # 双单精度拼接：高低位切割法，保留 48 位精度
             cont_int = cont_exponent.astype(np.float32)
             cont_frac_hi = cont_mantissa.astype(np.float32)
             cont_frac_lo = (cont_mantissa - cont_frac_hi.astype(np.float64)).astype(np.float32)
@@ -78,9 +77,7 @@ class NRE_DataPump:
         for col in char_cols:
             col_chars = []
             for text in df[col].astype(str).fillna(""):
-                # 🌟 核心升级 2：暴戾清洗脏数据，斩断所有无意义的头尾空格
                 text = text.strip() 
-                
                 if text.lower() == 'nan': text = ""
                 char_ids = [self.shared_chars.get(c, 0) for c in list(text)]
                 if len(char_ids) < self.max_seq_len:
@@ -98,7 +95,7 @@ class NRE_DataPump:
         }
 
     def build_cache(self, file_path, cache_path="data_cache.pt"):
-        print(f"🚀 正在解析 {file_path} 并执行【高低位双轨切割】全量无损张量化...")
+        print(f"🚀 正在解析 {file_path} 并执行张量化...")
         all_layers_data = {}
         
         ext = os.path.splitext(file_path)[-1].lower()
@@ -117,14 +114,14 @@ class NRE_DataPump:
         else:
             try:
                 layers = pyogrio.list_layers(file_path)
-                print(f"🌍 识别为空间矢量文件，智能探测到 {len(layers)} 个图层...")
+                print(f"🌍 识别为空间矢量文件，探测到 {len(layers)} 个图层...")
                 for layer_name, geom_type in layers:
                     print(f"   -> 正在抽取图层: [{layer_name}]")
                     try:
                         gdf = gpd.read_file(file_path, layer=layer_name, engine="pyogrio")
                         df = pd.DataFrame(gdf).drop(columns=['geometry'], errors='ignore')
                         if len(df) == 0:
-                            print(f"   ⚠️ 图层 [{layer_name}] 为空或无有效台账，已跳过。")
+                            print(f"   ⚠️ 图层 [{layer_name}] 为空或无有效台账，跳过。")
                             continue
                         all_layers_data[layer_name] = self._process_single_dataframe(df)
                     except Exception as e:
@@ -137,24 +134,29 @@ class NRE_DataPump:
         return all_layers_data
 
 if __name__ == "__main__":
-    print("=== data_loader.py 独立功能测试启动 (覆盖三大数据源) ===")
+    print("=== data_loader.py 全自动张量化流水线启动 ===")
     pump = NRE_DataPump()
     
-    DATA_SOURCES = [
-        {"file": "aanp.csv", "cache": "cache_aanp.pt"},
-        {"file": "LCXZ_TEST.gdb", "cache": "cache_lincao.pt"},
-        {"file": "福建省地图基本要素版100万.gdb", "cache": "cache_fujian.pt"}
-    ]
+    RAW_DATA_DIR = "./raw_data"
+    if not os.path.exists(RAW_DATA_DIR):
+        os.makedirs(RAW_DATA_DIR)
+        
+    DATA_SOURCES = []
+    for file_path in glob.glob(os.path.join(RAW_DATA_DIR, "*")):
+        if file_path.endswith('.csv') or file_path.endswith('.gdb'):
+            base_name = os.path.splitext(os.path.basename(file_path))[0]
+            cache_name = f"cache_{base_name}.pt"
+            DATA_SOURCES.append({"file": file_path, "cache": cache_name})
+            
+    print(f"📦 共规划了 {len(DATA_SOURCES)} 个数据源的缓存生成任务。")
     
     for source in DATA_SOURCES:
         file_path = source["file"]
         cache_path = source["cache"]
-        print(f"\n>>> [DataPump 测试] 探测数据源: {file_path}")
         
-        if os.path.exists(file_path):
-            try:
-                pump.build_cache(file_path, cache_path)
-            except Exception as e:
-                print(f"🚨 解析 {file_path} 时发生崩溃: {e}")
-        else:
-            print(f"⚠️ 未在当前目录找到 {file_path}，已跳过。")
+        if os.path.exists(cache_path):
+            print(f"⏩ 发现现有缓存 [{cache_path}]，为节省时间已跳过。如需重构请先删除原缓存。")
+            continue
+            
+        print(f"\n📂 正在切入数据源: [{file_path}]")
+        pump.build_cache(file_path, cache_path)

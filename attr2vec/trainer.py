@@ -1,4 +1,4 @@
-import os, torch, random, time, json
+import os, torch, random, time, json, glob
 import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
@@ -35,7 +35,6 @@ def load_all_caches(cache_files, is_master):
 def train():
     local_rank = setup_ddp(); is_master = (dist.get_rank() == 0)
     
-    # 🌟 核心防震荡与防OOM参数
     config = {'vocab_size': 20000}
     batch_size, epochs, base_lr, warmup_epochs = 1024, 1000, 1.2e-4, 50
     
@@ -44,7 +43,11 @@ def train():
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
     scaler = GradScaler('cuda')
 
-    data_all = load_all_caches(["cache_aanp.pt", "cache_lincao.pt", "cache_fujian.pt"], is_master)
+    cache_files = glob.glob("cache_*.pt")
+    if is_master: 
+        print(f"🧲 共发现 {len(cache_files)} 个张量缓存文件，准备汇入训练池...")
+
+    data_all = load_all_caches(cache_files, is_master)
     layer_names = list(data_all.keys())
     history = {"loss": [], "lr": []}; best_loss = float('inf'); start_time = time.time()
 
@@ -82,9 +85,8 @@ def train():
                 with open("train_history.json", "w") as f: json.dump(history, f)
             if avg_loss < best_loss:
                 best_loss = avg_loss; 
-                # 🌟 统一保存名，与流水线无缝衔接
                 torch.save(model.module.state_dict(), "best_model.pth")
-            print(f"📈 Ep {epoch+1:04d}/1000 | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
+            print(f"📈 Ep {epoch+1:04d}/{epochs} | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
 
     dist.destroy_process_group()
 
