@@ -10,22 +10,22 @@ from lincao_dict import FIELD_METADATA, LINCAO_CODE_DICT
 
 def load_and_preprocess_gdb(gdb_path, layer_name, cache_path="data_cache.pt"):
     # 🌟 护甲机制 1：缓存自愈与健康度核验
-    if os.path.exists(cache_path):
-        print(f"⚡ 检测到数据缓存，正在核验数据健康度...")
-        try:
-            data_dict = torch.load(cache_path)
-            if np.isnan(data_dict['raw_64']).any() or np.isnan(data_dict['cont_norm']).any():
-                print("⚠️ 警告：检测到旧版缓存中残留 NaN 毒数据！正在自动销毁并重建...")
-                os.remove(cache_path)
-            else:
-                print("✅ 缓存健康 (0 NaN)，瞬间载入成功！")
-                return data_dict
-        except Exception as e:
-            print(f"⚠️ 缓存读取异常 ({e})，正在重建...")
-            os.remove(cache_path)
+    # if os.path.exists(cache_path):
+    #     print(f"⚡ 检测到数据缓存，正在核验数据健康度...")
+    #     try:
+    #         data_dict = torch.load(cache_path)
+    #         if np.isnan(data_dict['raw_64']).any() or np.isnan(data_dict['cont_norm']).any():
+    #             print("⚠️ 警告：检测到旧版缓存中残留 NaN 毒数据！正在自动销毁并重建...")
+    #             os.remove(cache_path)
+    #         else:
+    #             print("✅ 缓存健康 (0 NaN)，瞬间载入成功！")
+    #             return data_dict
+    #     except Exception as e:
+    #         print(f"⚠️ 缓存读取异常 ({e})，正在重建...")
+    #         os.remove(cache_path)
 
     print(f"\n🚀 [之江实验室] 正在解析 GDB 并执行全要素强制脱毒与无损压缩...")
-    gdf = gpd.read_file(gdb_path, layer=layer_name, engine="pyogrio")
+    gdf = gpd.read_file(gdb_path, engine="pyogrio")
     df = pd.DataFrame(gdf).drop(columns=['geometry'], errors='ignore')
     
     # 暴力清除所有空白字符

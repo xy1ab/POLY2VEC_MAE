@@ -28,6 +28,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="attr2vec 预训练脚本")
     parser.add_argument("--data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/data/LCXZ_TEST.gdb")
     parser.add_argument("--layer_name", type=str, default="LCXZ_TEST01_XZ")
+    parser.add_argument("--cache_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/data/processed/chche_path.pt")
     parser.add_argument("--save_dir", type=str, default="./outputs/attr2vec")
     return parser
 
@@ -55,7 +56,7 @@ def main():
         print("="*115)
     
     # 获取数据
-    data = load_and_preprocess_gdb(args.data_path, args.layer_name)
+    data = load_and_preprocess_gdb(args.data_path, args.layer_name, args.cache_path)
     
     # 🌟 修复：提取解耦后的精确张量
     dataset = GDBDataset(
