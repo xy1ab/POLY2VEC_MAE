@@ -352,9 +352,9 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
 
     if dist_ctx.enabled and dist_ctx.world_size > 1:
         if device.type == "cuda":
-            model = DDP(model, device_ids=[dist_ctx.local_rank])
+            model = DDP(model, device_ids=[dist_ctx.local_rank], broadcast_buffers=False)
         else:
-            model = DDP(model)
+            model = DDP(model, broadcast_buffers=False)
     return model
 
 

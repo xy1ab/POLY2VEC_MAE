@@ -104,6 +104,11 @@ drop_rate: 0.0
 # =========================
 # 各解码 stage 的通道数，需与 encoder 下采样 stage 数量对齐。
 decoder_stage_channels: "256,192,128"
+# decoder 最终并不直接输出自由的 `Mag/Cos/Sin` 三通道，
+# 而是先输出两个 raw 通道 `(mag_raw, phase_raw)`，随后在模型内部映射为：
+# - `mag = softplus(mag_raw)`，保证幅值非负；
+# - `cos = cos(phase_raw)`、`sin = sin(phase_raw)`，保证相位位于单位圆上。
+# 这样可显式施加频域输出的物理约束，减少非法 `cos/sin` 组合。
 # 解码器注意力类型：
 # - none: 不使用 attention；
 # - window: 使用窗口注意力；

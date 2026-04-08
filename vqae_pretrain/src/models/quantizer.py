@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -93,6 +94,37 @@ class EMAVectorQuantizer(nn.Module):
     def is_initialized(self) -> bool:
         """Whether the codebook has been initialized from latent data."""
         return bool(self.initialized.item())
+
+    @staticmethod
+    def _dist_enabled() -> bool:
+        """Whether distributed collectives are currently available."""
+        return dist.is_available() and dist.is_initialized()
+
+    @classmethod
+    def _is_main_rank(cls) -> bool:
+        """Whether current process is rank 0 under distributed execution."""
+        return not cls._dist_enabled() or dist.get_rank() == 0
+
+    @classmethod
+    def _all_reduce_in_place(cls, tensor: torch.Tensor) -> torch.Tensor:
+        """All-reduce one tensor in place when distributed execution is enabled."""
+        if cls._dist_enabled():
+            dist.all_reduce(tensor)
+        return tensor
+
+    @classmethod
+    def _broadcast_in_place(cls, tensor: torch.Tensor) -> torch.Tensor:
+        """Broadcast one tensor from rank 0 when distributed execution is enabled."""
+        if cls._dist_enabled():
+            dist.broadcast(tensor, src=0)
+        return tensor
+
+    def _broadcast_state_from_rank0(self) -> None:
+        """Synchronize EMA buffers after rank-0-only mutations."""
+        self._broadcast_in_place(self.codebook)
+        self._broadcast_in_place(self.cluster_size)
+        self._broadcast_in_place(self.embed_avg)
+        self._broadcast_in_place(self.initialized)
 
     def _flatten(self, z: torch.Tensor) -> tuple[torch.Tensor, tuple[int, int, int, int]]:
         """Flatten `[B,C,H,W]` latent grids into `[N,C]` vectors."""
@@ -233,15 +265,15 @@ class EMAVectorQuantizer(nn.Module):
 
         with torch.no_grad():
             usage_counts = torch.bincount(indices, minlength=self.num_embeddings).float()
+            self._all_reduce_in_place(usage_counts)
             usage_probs = usage_counts / usage_counts.sum().clamp_min(1.0)
-            perplexity = torch.exp(
-                -(usage_probs * torch.log(usage_probs.clamp_min(1.0e-10))).sum()
-            )
+            perplexity = torch.exp(-(usage_probs * torch.log(usage_probs.clamp_min(1.0e-10))).sum())
             active_codes = (usage_counts > 0).sum().float()
 
             if self.training:
                 embed_sum = torch.zeros_like(self.embed_avg)
                 embed_sum.index_add_(0, indices, vectors.float())
+                self._all_reduce_in_place(embed_sum)
 
                 self.cluster_size.mul_(self.decay).add_(usage_counts, alpha=1.0 - self.decay)
                 self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1.0 - self.decay)
@@ -253,7 +285,9 @@ class EMAVectorQuantizer(nn.Module):
                     * total_count.clamp_min(1.0)
                 )
                 self.codebook.copy_(self.embed_avg / normalized_cluster_size.unsqueeze(1))
-                self._restart_dead_codes(vectors)
+                if self._is_main_rank():
+                    self._restart_dead_codes(vectors)
+                self._broadcast_state_from_rank0()
 
         return QuantizerOutput(
             quantized=quantized_st,

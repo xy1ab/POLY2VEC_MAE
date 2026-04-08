@@ -103,7 +103,7 @@ class PolyVqAutoencoder(nn.Module):
 
         self.decoder = PolyDecoder(
             latent_dim=self.embed_dim,
-            out_chans=self.in_chans,
+            out_chans=2,
             stage_channels=decoder_stage_channels,
             upsample_scales=upsample_scales,
             attention_type=decoder_attention_type,
@@ -126,8 +126,14 @@ class PolyVqAutoencoder(nn.Module):
         return self.pre_vq_proj(self.pre_vq_norm(latent))
 
     def decode_from_code_features(self, code_features: torch.Tensor) -> torch.Tensor:
-        """Decode pre-quantization or quantized code features into images."""
-        return self.decoder(self.post_vq_proj(code_features))
+        """Decode code features into physically constrained frequency images."""
+        decoder_raw = self.decoder(self.post_vq_proj(code_features))
+        mag_raw = decoder_raw[:, 0:1]
+        phase_raw = decoder_raw[:, 1:2]
+        mag = torch.nn.functional.softplus(mag_raw)
+        cos = torch.cos(phase_raw)
+        sin = torch.sin(phase_raw)
+        return torch.cat([mag, cos, sin], dim=1)
 
     def decode_indices(self, indices: torch.Tensor) -> torch.Tensor:
         """Decode integer code indices `[B,H,W]` into reconstructed images."""

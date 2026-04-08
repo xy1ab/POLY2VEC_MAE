@@ -2,7 +2,9 @@
 
 The decoder uses a multi-stage coarse-to-fine design. Each stage is composed
 of optional attention blocks followed by convolutional refinement blocks, then
-an upsampling step that increases spatial resolution.
+an upsampling step that increases spatial resolution. In the default VQAE
+model, the decoder predicts two raw channels `(mag_raw, phase_raw)` and the
+model projects them into constrained `(mag, cos, sin)` outputs.
 """
 
 from __future__ import annotations

@@ -16,6 +16,11 @@ cd /home/xiaoyang/workspace/poly2vec_mae/vqae_pretrain
   - encoder token 数由 `stem_strides` 的总下采样倍率决定，不再使用 patchify 作为 token 化入口；
   - 训练损失直接对完整频域图 `Mag/Cos/Sin` 计算，不再使用 patch-based loss；
   - 输入频域图会自动 padding 到 `latent_stride` 的整数倍。
+  - decoder 内部先预测两个 raw 通道 `(mag_raw, phase_raw)`，再统一映射成受约束的三通道输出：
+    - `mag = softplus(mag_raw)`
+    - `cos = cos(phase_raw)`
+    - `sin = sin(phase_raw)`
+    这让重建结果天然满足 `mag >= 0` 与 `cos^2 + sin^2 = 1`。
 
 - warmup 机制：
   - `warmup_epochs`：学习率 warmup，从训练开始即生效。

@@ -41,6 +41,9 @@ class VqAeForwardContractTest(unittest.TestCase):
         outputs = model(imgs, use_vq=False)
 
         self.assertEqual(outputs.recon_imgs.shape, imgs.shape)
+        self.assertTrue(torch.all(outputs.recon_imgs[:, 0] >= 0.0))
+        phase_norm = outputs.recon_imgs[:, 1].square() + outputs.recon_imgs[:, 2].square()
+        self.assertTrue(torch.allclose(phase_norm, torch.ones_like(phase_norm), atol=1e-5, rtol=1e-5))
         self.assertIsNone(outputs.indices)
         self.assertFalse(outputs.using_vq)
 
@@ -54,6 +57,9 @@ class VqAeForwardContractTest(unittest.TestCase):
         self.assertIsNotNone(outputs.indices)
         self.assertEqual(outputs.indices.shape, (2, 4, 4))
         self.assertEqual(outputs.recon_imgs.shape, imgs.shape)
+        self.assertTrue(torch.all(outputs.recon_imgs[:, 0] >= 0.0))
+        phase_norm = outputs.recon_imgs[:, 1].square() + outputs.recon_imgs[:, 2].square()
+        self.assertTrue(torch.allclose(phase_norm, torch.ones_like(phase_norm), atol=1e-5, rtol=1e-5))
         self.assertTrue(outputs.using_vq)
 
     def test_decode_indices_restores_full_resolution_images(self) -> None:
