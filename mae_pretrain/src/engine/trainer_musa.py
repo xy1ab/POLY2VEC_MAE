@@ -758,6 +758,8 @@ def train_main(args) -> None:
 
     run_config = dict(vars(args))
     if is_main_process(dist_ctx):
+        print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
+        print(f"[INFO] ICFT spatial chunk: {converter.icft_spatial_chunk_size}")
         _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
@@ -1035,8 +1037,11 @@ def train_main(args) -> None:
                     pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
                     pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
 
-                    img_recon = img_orig.clone()
-                    img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
+                    if str(args.loss_mode).lower() == "full":
+                        img_recon = pred_img
+                    else:
+                        img_recon = img_orig.clone()
+                        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
 
                     mag_recon = img_recon[0].unsqueeze(0).to(device)
                     cos_recon = img_recon[1].unsqueeze(0).to(device)
@@ -1139,6 +1144,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--w_min", type=float, default=0.1)
     parser.add_argument("--w_max", type=float, default=200.0)
     parser.add_argument("--freq_type", type=str, default="geometric")
+    parser.add_argument("--cft_triangle_chunk_size", type=int, default=2048)
+    parser.add_argument("--icft_spatial_chunk_size", type=int, default=256)
 
     parser.add_argument("--patch_size", type=int, default=4)
     parser.add_argument("--embed_dim", type=int, default=384)

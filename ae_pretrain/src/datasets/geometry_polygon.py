@@ -549,7 +549,7 @@ class PolygonGeometryCodec(GeometryCodec):
         return self.converter.icft_2d(f_uv_real, f_uv_imag=f_uv_imag, spatial_size=spatial_size)
 
     def triangles_to_image_channels(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
-        """Convert triangle arrays to MAE input channels (mag, cos, sin).
+        """Convert triangle arrays to AE input channels (mag, cos, sin).
 
         Args:
             triangles_list: List of triangle arrays `[T_i,3,2]`.

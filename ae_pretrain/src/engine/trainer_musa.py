@@ -1,10 +1,10 @@
-"""Training engine for polygon MAE pretraining.
+"""Training engine for polygon AE pretraining on MUSA devices.
 
 This module implements:
 1) Data loading and train/val split.
-2) MAE training loop with fp32/bf16/fp16 precision support.
+2) AE training loop with fp32/bf16/fp16 precision support.
 3) DDP-aware metric reduction.
-4) Checkpoint/export generation.
+4) Epoch-level resume checkpoints with best-model tracking.
 5) Reconstruction visualization for qualitative monitoring.
 """
 
@@ -21,13 +21,14 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.path import Path as MplPath
 import numpy as np
+import torch_musa  # noqa: F401
 import torch
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
-from ..datasets.collate import mae_collate_fn
+from ..datasets.collate import ae_collate_fn
 from ..datasets.pt_manifest import PtShardManifest
 from ..datasets.registry import get_geometry_codec
 from ..datasets.shard_io import resolve_triangle_shard_paths
@@ -37,24 +38,24 @@ from ..datasets.sharded_pt_dataset import (
     load_all_samples_from_manifest,
 )
 from ..losses.recon_mag_phase import compute_mag_phase_losses
-from ..models.mae import MaskedAutoencoderViTPoly
+from ..models.factory import build_ae_model_from_config
 from ..utils.checkpoint import (
     load_latest_training_state,
     save_checkpoint,
     save_latest_training_state_pair,
 )
 from ..utils.config import dump_yaml_config
-from ..utils.dist import (
+from ..utils.dist_musa import (
     DistContext,
     all_reduce_mean,
     cleanup_distributed,
     distributed_barrier,
-    init_distributed,
+    init_distributed_musa,
     is_main_process,
 )
 from ..utils.filesystem import ensure_dir, make_timestamped_dir
 from ..utils.logger import attach_tee_stdout
-from ..utils.precision import autocast_context, build_grad_scaler, normalize_precision
+from ..utils.precision_musa import autocast_context, build_grad_scaler, normalize_precision
 from ..utils.safe_load import register_numpy_safe_globals
 from ..utils.seed import capture_rng_state, restore_rng_state, set_global_seed
 
@@ -63,14 +64,24 @@ _RESUME_LOCKED_KEYS = {
     "geom_type",
     "data_dir",
     "data_path",
-    "loss_mode",
     "patch_size",
+    "stem_channels",
+    "stem_strides",
     "embed_dim",
     "depth",
     "num_heads",
-    "dec_embed_dim",
-    "dec_depth",
-    "dec_num_heads",
+    "mlp_ratio",
+    "drop_rate",
+    "drop_path_rate",
+    "decoder_stage_channels",
+    "decoder_attention_type",
+    "decoder_attention_heads",
+    "decoder_attention_depths",
+    "decoder_conv_depths",
+    "decoder_window_size",
+    "decoder_upsample_mode",
+    "decoder_mlp_ratio",
+    "decoder_drop_rate",
     "pos_freqs",
     "w_min",
     "w_max",
@@ -200,13 +211,11 @@ def plot_reconstruction(
         img_recon: Reconstructed image `[3,H,W]`.
         spatial_gt: Spatial ground truth raster `[H,W]`.
         spatial_icft_orig: ICFT reconstruction from original spectrum.
-        spatial_icft_recon: ICFT reconstruction from MAE output.
+        spatial_icft_recon: ICFT reconstruction from AE output.
         epoch: Current epoch index (1-based).
         save_dir: Directory for output images.
     """
     fig = plt.figure(figsize=(30, 12))
-    # Use nested grids so we can tighten only the left frequency panels while
-    # keeping right spatial panels enlarged and readable.
     outer = fig.add_gridspec(1, 2, width_ratios=[3.0, 5.1], wspace=0.10)
     gs_left = outer[0, 0].subgridspec(3, 3, wspace=0.02, hspace=0.24)
     gs_right = outer[0, 1].subgridspec(1, 3, wspace=0.20)
@@ -225,11 +234,11 @@ def plot_reconstruction(
     axes_right = [fig.add_subplot(gs_right[0, 0]), fig.add_subplot(gs_right[0, 1]), fig.add_subplot(gs_right[0, 2])]
 
     titles_left = [
-        ["Original Mag", "Masked Mag", "Reconstructed Mag"],
-        ["Original Cos(Phase)", "Masked Cos(Phase)", "Reconstructed Cos(Phase)"],
-        ["Original Sin(Phase)", "Masked Sin(Phase)", "Reconstructed Sin(Phase)"],
+        ["Original Mag", "Input Mag", "Reconstructed Mag"],
+        ["Original Cos(Phase)", "Input Cos(Phase)", "Reconstructed Cos(Phase)"],
+        ["Original Sin(Phase)", "Input Sin(Phase)", "Reconstructed Sin(Phase)"],
     ]
-    titles_right = ["Strict Spatial GT (0/1)", "ICFT (Orig Freqs)", "ICFT (MAE Recon Freqs)"]
+    titles_right = ["Strict Spatial GT (0/1)", "ICFT (Orig Freqs)", "ICFT (AE Recon Freqs)"]
 
     data_left = [
         [(img_orig[0], vmin_mag, vmax_mag), (img_masked[0], vmin_mag, vmax_mag), (img_recon[0], vmin_mag, vmax_mag)],
@@ -255,7 +264,6 @@ def plot_reconstruction(
             ax.set_aspect("equal", adjustable="box")
             ax.set_title(titles_left[row][col], fontsize=14)
             ax.axis("off")
-            # Keep colorbars compact so left frequency columns stay visually tight.
             plt.colorbar(im, ax=ax, fraction=0.040, pad=0.015)
 
     for col in range(3):
@@ -276,8 +284,6 @@ def plot_reconstruction(
         ax.axis("off")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
-    # `tight_layout` may be unstable with this mixed GridSpec + colorbar layout.
-    # Use explicit margins for deterministic panel placement across matplotlib versions.
     fig.subplots_adjust(left=0.02, right=0.98, top=0.95, bottom=0.04)
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
@@ -286,27 +292,30 @@ def plot_reconstruction(
 
 
 def _build_model_config(args, img_size: tuple[int, int]) -> dict:
-    """Build persisted model config dict for downstream reload.
-
-    Args:
-        args: Parsed training arguments.
-        img_size: Runtime image size inferred from Fourier grid.
-
-    Returns:
-        Serializable model config dict.
-    """
+    """Build persisted model config dict for downstream reload."""
     return {
         "geom_type": args.geom_type,
-        "loss_mode": args.loss_mode,
+        "train_type": args.train_type,
         "img_size": img_size,
         "patch_size": args.patch_size,
         "in_chans": 3,
+        "stem_channels": args.stem_channels,
+        "stem_strides": args.stem_strides,
         "embed_dim": args.embed_dim,
         "depth": args.depth,
         "num_heads": args.num_heads,
-        "dec_embed_dim": args.dec_embed_dim,
-        "dec_depth": args.dec_depth,
-        "dec_num_heads": args.dec_num_heads,
+        "mlp_ratio": args.mlp_ratio,
+        "drop_rate": args.drop_rate,
+        "drop_path_rate": args.drop_path_rate,
+        "decoder_stage_channels": args.decoder_stage_channels,
+        "decoder_attention_type": args.decoder_attention_type,
+        "decoder_attention_heads": args.decoder_attention_heads,
+        "decoder_attention_depths": args.decoder_attention_depths,
+        "decoder_conv_depths": args.decoder_conv_depths,
+        "decoder_window_size": args.decoder_window_size,
+        "decoder_upsample_mode": args.decoder_upsample_mode,
+        "decoder_mlp_ratio": args.decoder_mlp_ratio,
+        "decoder_drop_rate": args.decoder_drop_rate,
         "pos_freqs": args.pos_freqs,
         "w_min": args.w_min,
         "w_max": args.w_max,
@@ -315,31 +324,36 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
 
 
 def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx: DistContext):
-    """Construct MAE model and optional DDP wrapper.
-
-    Args:
-        args: Parsed training arguments.
-        img_size: Runtime image size.
-        device: Runtime device.
-        dist_ctx: Distributed context.
-
-    Returns:
-        Model instance (possibly DDP-wrapped).
-    """
-    model = MaskedAutoencoderViTPoly(
-        img_size=img_size,
-        patch_size=args.patch_size,
-        in_chans=3,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        decoder_embed_dim=args.dec_embed_dim,
-        decoder_depth=args.dec_depth,
-        decoder_num_heads=args.dec_num_heads,
-    ).to(device)
+    """Construct AE model and optional DDP wrapper."""
+    model = build_ae_model_from_config(
+        {
+            "img_size": img_size,
+            "patch_size": args.patch_size,
+            "in_chans": 3,
+            "stem_channels": args.stem_channels,
+            "stem_strides": args.stem_strides,
+            "embed_dim": args.embed_dim,
+            "depth": args.depth,
+            "num_heads": args.num_heads,
+            "mlp_ratio": args.mlp_ratio,
+            "drop_rate": args.drop_rate,
+            "drop_path_rate": args.drop_path_rate,
+            "decoder_stage_channels": args.decoder_stage_channels,
+            "decoder_attention_type": args.decoder_attention_type,
+            "decoder_attention_heads": args.decoder_attention_heads,
+            "decoder_attention_depths": args.decoder_attention_depths,
+            "decoder_conv_depths": args.decoder_conv_depths,
+            "decoder_window_size": args.decoder_window_size,
+            "decoder_upsample_mode": args.decoder_upsample_mode,
+            "decoder_mlp_ratio": args.decoder_mlp_ratio,
+            "decoder_drop_rate": args.decoder_drop_rate,
+        },
+        device=device,
+        precision="fp32",
+    )
 
     if dist_ctx.enabled and dist_ctx.world_size > 1:
-        if device.type == "cuda":
+        if device.type == "musa":
             model = DDP(model, device_ids=[dist_ctx.local_rank])
         else:
             model = DDP(model)
@@ -386,6 +400,15 @@ def _build_scheduler(args, optimizer):
 
 def _validate_training_args(args) -> None:
     """Validate numeric hyperparameters before building the training pipeline."""
+    def _parse_csv_ints(name: str, value: str) -> list[int]:
+        try:
+            items = [int(item.strip()) for item in str(value).split(",") if item.strip()]
+        except ValueError as exc:
+            raise ValueError(f"`{name}` must be a comma-separated integer list, got {value!r}") from exc
+        if not items:
+            raise ValueError(f"`{name}` must not be empty")
+        return items
+
     try:
         augment_float = float(args.augment_times)
     except (TypeError, ValueError) as exc:
@@ -399,9 +422,10 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.patch_size <= 0:
         raise ValueError(f"`patch_size` must be > 0, got {args.patch_size}")
-    if args.loss_mode not in {"mask", "full"}:
-        raise ValueError(f"`loss_mode` must be 'mask' or 'full', got {args.loss_mode!r}")
-    MaskedAutoencoderViTPoly._validate_mask_ratio(args.mask_ratio)
+    if args.depth <= 0:
+        raise ValueError(f"`depth` must be > 0, got {args.depth}")
+    if args.num_heads <= 0:
+        raise ValueError(f"`num_heads` must be > 0, got {args.num_heads}")
     if not (0.0 < float(args.val_ratio) < 1.0):
         raise ValueError(f"`val_ratio` must be in (0, 1), got {args.val_ratio}")
     if not augment_float.is_integer():
@@ -416,6 +440,24 @@ def _validate_training_args(args) -> None:
         raise ValueError(f"`w_min` must be > 0 for geometric freq grids, got {args.w_min}")
     if args.w_max < args.w_min:
         raise ValueError(f"`w_max` must be >= `w_min`, got w_min={args.w_min}, w_max={args.w_max}")
+
+    stem_channels = _parse_csv_ints("stem_channels", args.stem_channels)
+    stem_strides = _parse_csv_ints("stem_strides", args.stem_strides)
+    if len(stem_channels) != len(stem_strides):
+        raise ValueError("`stem_channels` and `stem_strides` must have the same length")
+
+    decoder_stage_channels = _parse_csv_ints("decoder_stage_channels", args.decoder_stage_channels)
+    decoder_attention_heads = _parse_csv_ints("decoder_attention_heads", args.decoder_attention_heads)
+    decoder_attention_depths = _parse_csv_ints("decoder_attention_depths", args.decoder_attention_depths)
+    decoder_conv_depths = _parse_csv_ints("decoder_conv_depths", args.decoder_conv_depths)
+    stage_count = len(stem_strides)
+    if len(decoder_stage_channels) != stage_count:
+        raise ValueError(
+            f"`decoder_stage_channels` length must equal encoder stem stage count {stage_count}, "
+            f"got {len(decoder_stage_channels)}"
+        )
+    if not (len(decoder_attention_heads) == len(decoder_attention_depths) == len(decoder_conv_depths) == stage_count):
+        raise ValueError("Decoder stage config lengths must all match the encoder stem stage count")
 
 
 def _advance_scheduler(scheduler, completed_epochs: int) -> None:
@@ -498,20 +540,12 @@ def _sync_run_metadata(best_dir: Path, ckpt_dir: Path, run_config: dict, model_c
     """Persist training config and model config into both `best/` and `ckpt/`."""
     dump_yaml_config(run_config, best_dir / "config.yaml")
     dump_yaml_config(run_config, ckpt_dir / "config.yaml")
-    _write_json(best_dir / "poly_mae_config.json", model_config)
-    _write_json(ckpt_dir / "poly_mae_config.json", model_config)
+    _write_json(best_dir / "poly_ae_config.json", model_config)
+    _write_json(ckpt_dir / "poly_ae_config.json", model_config)
 
 
 def _resolve_training_pt_files(args, warn_fn=None) -> list[Path]:
-    """Resolve training shard files from directory input or compatibility path.
-
-    Args:
-        args: Parsed training arguments namespace.
-        warn_fn: Optional warning sink for manifest fallback cases.
-
-    Returns:
-        Ordered absolute `.pt` shard paths.
-    """
+    """Resolve ordered training shard files from directory input or compatibility path."""
     data_dir = getattr(args, "data_dir", None)
     if data_dir:
         data_dir = Path(str(data_dir)).expanduser().resolve()
@@ -529,16 +563,7 @@ def _resolve_training_pt_files(args, warn_fn=None) -> list[Path]:
 
 
 def _split_dataset_indices(total_size: int, val_ratio: float, split_seed: int) -> tuple[list[int], list[int]]:
-    """Split global sample indices into train/validation subsets.
-
-    Args:
-        total_size: Total number of samples in the manifest.
-        val_ratio: Validation ratio.
-        split_seed: Random seed for split reproducibility.
-
-    Returns:
-        Tuple `(train_indices, val_indices)`.
-    """
+    """Split global sample indices into train/validation subsets."""
     if total_size < 2:
         raise ValueError("Training requires at least two samples to build train/val splits.")
 
@@ -559,16 +584,7 @@ def _build_datasets(
     train_indices: list[int] | None = None,
     val_indices: list[int] | None = None,
 ):
-    """Build train/validation datasets for eager or lazy loading.
-
-    Args:
-        args: Parsed training arguments.
-        manifest: Manifest of all training shard files.
-        dist_ctx: Distributed context.
-
-    Returns:
-        Tuple `(train_dataset, val_dataset, cache_shards)`.
-    """
+    """Build train/validation datasets for eager or lazy loading."""
     if train_indices is None or val_indices is None:
         train_indices, val_indices = _split_dataset_indices(
             total_size=manifest.total_samples,
@@ -613,17 +629,7 @@ def _build_datasets(
 
 
 def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
-    """Build train/validation dataloaders from prepared datasets.
-
-    Args:
-        args: Parsed training args.
-        train_dataset: Training dataset object.
-        val_dataset: Validation dataset object.
-        dist_ctx: Distributed context.
-
-    Returns:
-        Tuple `(train_dataset, val_dataset, train_loader, val_loader, train_sampler)`.
-    """
+    """Build train/validation dataloaders from prepared datasets."""
     persistent_workers = bool(args.num_workers > 0 and args.load_mode == "lazy")
 
     use_distributed_sampler = dist_ctx.enabled and dist_ctx.world_size > 1
@@ -636,7 +642,7 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
             train_dataset,
             batch_size=args.batch_size,
             sampler=train_sampler,
-            collate_fn=mae_collate_fn,
+            collate_fn=ae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=persistent_workers,
@@ -645,7 +651,7 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
             val_dataset,
             batch_size=args.batch_size,
             sampler=val_sampler,
-            collate_fn=mae_collate_fn,
+            collate_fn=ae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=persistent_workers,
@@ -656,7 +662,7 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
             train_dataset,
             batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=mae_collate_fn,
+            collate_fn=ae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=persistent_workers,
@@ -665,7 +671,7 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
             val_dataset,
             batch_size=args.batch_size,
             shuffle=False,
-            collate_fn=mae_collate_fn,
+            collate_fn=ae_collate_fn,
             num_workers=args.num_workers,
             pin_memory=True,
             persistent_workers=persistent_workers,
@@ -675,17 +681,7 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
 
 
 def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device):
-    """Prepare one fixed validation sample for per-epoch reconstruction plots.
-
-    Args:
-        args: Parsed training args.
-        codec: Polygon geometry codec.
-        val_dataset: Validation dataset.
-        device: Runtime device.
-
-    Returns:
-        Tuple `(fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig)`.
-    """
+    """Prepare one fixed validation sample for per-epoch reconstruction plots."""
     fixed_tris_orig = val_dataset.get_base_sample(0)
     fixed_tris = torch.tensor(fixed_tris_orig, dtype=torch.float32)
 
@@ -701,15 +697,13 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
 
     return fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig
 
+
 def count_parameters(model):
-    model = model.module if hasattr(model, 'module') else model
-    # 计算总参数量 (单位: 百万 M)
+    """Print model parameter counts."""
+    model = model.module if hasattr(model, "module") else model
     total_params = sum(p.numel() for p in model.parameters())
-    
-    # 计算 Encoder 部分参数量
-    # 假设你的模型中 encoder 对象的变量名是 'encoder'
     encoder_params = sum(p.numel() for p in model.encoder.parameters())
-    
+
     print(f"总参数量: {total_params / 1e6:.2f} M")
     print(f"Encoder 参数量: {encoder_params / 1e6:.2f} M")
     print(f"Encoder 占比: {(encoder_params / total_params) * 100:.2f}%")
@@ -745,13 +739,8 @@ def _raise_nonfinite_training_error(stage: str, epoch: int, step: int, tensors: 
         f"Non-finite tensor detected during {stage} at epoch={epoch + 1}, step={step}: "
         + " | ".join(summaries)
     )
-
 def train_main(args) -> None:
-    """Main training entrypoint.
-
-    Args:
-        args: Parsed training arguments namespace.
-    """
+    """Main training entrypoint."""
     register_numpy_safe_globals()
     args.load_mode = str(args.load_mode).lower()
     args.resume_dir = str(Path(args.resume_dir).expanduser().resolve()) if args.resume_dir else None
@@ -760,7 +749,7 @@ def train_main(args) -> None:
 
     set_global_seed(args.seed, deterministic=args.deterministic)
 
-    dist_ctx = init_distributed()
+    dist_ctx = init_distributed_musa()
     device = dist_ctx.device
 
     args.precision = normalize_precision(args.precision)
@@ -805,9 +794,8 @@ def train_main(args) -> None:
             "[INFO] Distributed    : "
             f"enabled={dist_ctx.enabled}, world_size={dist_ctx.world_size}, "
             f"rank={dist_ctx.rank}, local_rank={dist_ctx.local_rank}, device={device}, "
-            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+            f"MUSA_VISIBLE_DEVICES={os.environ.get('MUSA_VISIBLE_DEVICES', '<unset>')}"
         )
-        print(f"[INFO] Loss mode      : {args.loss_mode}")
         print(f"[INFO] Eval frequency  : every {args.eval_every} epoch(s)")
         if args.resume_dir:
             print(f"[INFO] Resume mode    : dir={args.resume_dir}, checkpoint={resume_path}")
@@ -832,16 +820,22 @@ def train_main(args) -> None:
     model_config = _build_model_config(args, img_size=img_size)
 
     run_config = dict(vars(args))
-
     if is_main_process(dist_ctx):
         print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
         print(f"[INFO] ICFT spatial chunk: {converter.icft_spatial_chunk_size}")
-        _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     freq_span_patches = compute_freq_span_patches(converter, args.patch_size, device=device)
-    
+
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
     model_to_save = model.module if isinstance(model, DDP) else model
+    model_config["latent_stride"] = int(model_to_save.encoder.latent_stride)
+    model_config["latent_grid_size"] = tuple(int(v) for v in model_to_save.encoder.latent_grid_size)
+    run_config["latent_stride"] = model_config["latent_stride"]
+    run_config["latent_grid_size"] = model_config["latent_grid_size"]
+    if is_main_process(dist_ctx):
+        print(f"[INFO] Latent stride  : {model_config['latent_stride']}")
+        print(f"[INFO] Latent grid    : {model_config['latent_grid_size']}")
+        _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     if resume_state is not None:
         model_to_save.load_state_dict(resume_state["model_state"], strict=True)
@@ -941,20 +935,17 @@ def train_main(args) -> None:
                     imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
 
                 with autocast_context(device, args.precision):
-                    pred, mask = model(imgs, mask_ratio=args.mask_ratio)
+                    pred = model(imgs)
 
                 pred = pred.float()
-                mask = mask.float()
                 target_patches = patchify(imgs, args.patch_size).float()
 
                 loss_mag, loss_phase = compute_mag_phase_losses(
                     pred=pred,
                     target_patches=target_patches,
-                    mask=mask,
                     patch_size=args.patch_size,
                     freq_span_patches=freq_span_patches,
                     weight_mag_hf=args.weight_mag_hf,
-                    loss_mode=args.loss_mode,
                 )
                 loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
                 if not bool(torch.isfinite(loss).item()):
@@ -966,7 +957,6 @@ def train_main(args) -> None:
                             "imgs": imgs,
                             "pred": pred,
                             "target_patches": target_patches,
-                            "mask": mask,
                             "loss_mag": loss_mag,
                             "loss_phase": loss_phase,
                             "loss_total": loss,
@@ -1020,20 +1010,17 @@ def train_main(args) -> None:
                         imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
 
                         with autocast_context(device, args.precision):
-                            pred_v, mask_v = model(imgs_v, mask_ratio=args.mask_ratio)
+                            pred_v = model(imgs_v)
 
                         pred_v = pred_v.float()
-                        mask_v = mask_v.float()
                         target_patches_v = patchify(imgs_v, args.patch_size).float()
 
                         loss_mag_v, loss_phase_v = compute_mag_phase_losses(
                             pred=pred_v,
                             target_patches=target_patches_v,
-                            mask=mask_v,
                             patch_size=args.patch_size,
                             freq_span_patches=freq_span_patches,
                             weight_mag_hf=args.weight_mag_hf,
-                            loss_mode=args.loss_mode,
                         )
 
                         loss_total_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
@@ -1046,7 +1033,6 @@ def train_main(args) -> None:
                                     "imgs_val": imgs_v,
                                     "pred_val": pred_v,
                                     "target_patches_val": target_patches_v,
-                                    "mask_val": mask_v,
                                     "loss_mag_val": loss_mag_v,
                                     "loss_phase_val": loss_phase_v,
                                     "loss_total_val": loss_total_v,
@@ -1093,10 +1079,9 @@ def train_main(args) -> None:
                     imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
 
                     with autocast_context(device, args.precision):
-                        pred_fix, mask_fix = model(imgs_fix, mask_ratio=args.mask_ratio)
+                        pred_fix = model(imgs_fix)
 
                     pred_fix = pred_fix.float()
-                    mask_fix = mask_fix.float()
 
                     p = args.patch_size
                     h, w = imgs_fix.shape[2], imgs_fix.shape[3]
@@ -1104,20 +1089,12 @@ def train_main(args) -> None:
 
                     img_orig = imgs_fix[0].cpu()
 
-                    mask_map = mask_fix[0].cpu().reshape(h_p, w_p, 1, 1).expand(-1, -1, p, p)
-                    mask_map = mask_map.permute(0, 2, 1, 3).reshape(h, w)
-
                     img_masked = img_orig.clone()
-                    img_masked[:, mask_map == 1] = torch.nan
 
                     pred_img = pred_fix[0].cpu().reshape(h_p, w_p, 3, p, p)
                     pred_img = torch.einsum("hwcpq->chpwq", pred_img).reshape(3, h, w)
 
-                    if str(args.loss_mode).lower() == "full":
-                        img_recon = pred_img
-                    else:
-                        img_recon = img_orig.clone()
-                        img_recon[:, mask_map == 1] = pred_img[:, mask_map == 1]
+                    img_recon = pred_img
 
                     mag_recon = img_recon[0].unsqueeze(0).to(device)
                     cos_recon = img_recon[1].unsqueeze(0).to(device)
@@ -1141,11 +1118,7 @@ def train_main(args) -> None:
                 current_val_loss = float(avg_val_loss.item())
                 if current_val_loss < best_val_loss:
                     best_val_loss = current_val_loss
-                    save_checkpoint(
-                        best_dir / "mae_best.pth",
-                        model_to_save.state_dict(),
-                        precision=args.checkpoint_dtype,
-                    )
+                    save_checkpoint(best_dir / "ae_best.pth", model_to_save.state_dict(), precision=args.checkpoint_dtype)
                     save_checkpoint(
                         best_dir / "encoder_best.pth",
                         model_to_save.encoder.state_dict(),
@@ -1184,19 +1157,15 @@ def train_main(args) -> None:
         raise
     finally:
         cleanup_distributed(dist_ctx)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        if torch.musa.is_available():
+            torch.musa.empty_cache()
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI parser for training engine.
+    """Build CLI parser for training engine."""
+    parser = argparse.ArgumentParser(description="AE pretraining trainer")
 
-    Returns:
-        Configured argument parser.
-    """
-    parser = argparse.ArgumentParser(description="MAE pretraining trainer")
-
-    parser.add_argument("--train_type", type=str, default="mae")
+    parser.add_argument("--train_type", type=str, default="ae")
     parser.add_argument("--geom_type", type=str, default="polygon")
 
     parser.add_argument("--data_dir", type=str, default="./data/processed/hangzhou")
@@ -1228,20 +1197,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--icft_spatial_chunk_size", type=int, default=256)
 
     parser.add_argument("--patch_size", type=int, default=4)
+    parser.add_argument("--stem_channels", type=str, default="64,128,256")
+    parser.add_argument("--stem_strides", type=str, default="2,2,2")
     parser.add_argument("--embed_dim", type=int, default=384)
-    parser.add_argument("--depth", type=int, default=12)
+    parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--num_heads", type=int, default=8)
+    parser.add_argument("--mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--drop_rate", type=float, default=0.0)
+    parser.add_argument("--drop_path_rate", type=float, default=0.0)
 
-    parser.add_argument("--dec_embed_dim", type=int, default=128)
-    parser.add_argument("--dec_depth", type=int, default=4)
-    parser.add_argument("--dec_num_heads", type=int, default=4)
+    parser.add_argument("--decoder_stage_channels", type=str, default="256,192,128")
+    parser.add_argument("--decoder_attention_type", type=str, default="window", choices=("none", "window", "global"))
+    parser.add_argument("--decoder_attention_heads", type=str, default="8,4,4")
+    parser.add_argument("--decoder_attention_depths", type=str, default="1,1,0")
+    parser.add_argument("--decoder_conv_depths", type=str, default="2,2,2")
+    parser.add_argument("--decoder_window_size", type=int, default=8)
+    parser.add_argument("--decoder_upsample_mode", type=str, default="bilinear", choices=("nearest", "bilinear", "bicubic"))
+    parser.add_argument("--decoder_mlp_ratio", type=float, default=4.0)
+    parser.add_argument("--decoder_drop_rate", type=float, default=0.0)
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=2e-3)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--mask_ratio", type=float, default=0.75)
-    parser.add_argument("--loss_mode", type=str, default="full", choices=("mask", "full"))
     parser.add_argument("--augment_times", type=int, default=10)
 
     parser.add_argument("--precision", type=str, default="bf16")
@@ -1256,18 +1234,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_cli(argv=None) -> None:
-    """CLI wrapper for trainer.
-
-    Args:
-        argv: Optional argv list for programmatic invocation.
-    """
+    """CLI wrapper for trainer."""
     parser = build_arg_parser()
     args = parser.parse_args(argv)
 
-    # Keep compatibility with existing usage where users pass visible devices.
     if "LOCAL_RANK" not in os.environ:
-        # Only set CUDA_VISIBLE_DEVICES for non-torchrun single-process launches.
-        # torchrun already controls process-local device visibility.
-        os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
+        os.environ.setdefault("MUSA_VISIBLE_DEVICES", str(args.gpu))
 
     train_main(args)

@@ -2,9 +2,7 @@
 
 This module exposes two stable classes:
 1) `PolyEncoderPipeline` for embedding extraction.
-2) `PolyMaeReconstructionPipeline` for MAE reconstruction outputs.
-
-Downstream code should only depend on this file and exported model bundles.
+2) `PolyAeReconstructionPipeline` for AE reconstruction outputs.
 """
 
 from __future__ import annotations
@@ -16,7 +14,7 @@ import torch
 
 from ..datasets.geometry_polygon import ensure_polygon_array, normalize_polygon_bbox, pad_triangle_batch
 from ..datasets.registry import get_geometry_codec
-from ..models.factory import load_mae_model, load_pretrained_encoder
+from ..models.factory import load_ae_model, load_pretrained_encoder
 from ..utils.config import load_config_any
 from ..utils.precision import autocast_context, normalize_precision
 
@@ -92,7 +90,7 @@ class PolyEncoderPipeline:
         return triangles_list, meta_tensor
 
     def triangles_to_images(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
-        """Convert triangle arrays to MAE-compatible input channels.
+        """Convert triangle arrays to AE-compatible input channels.
 
         Args:
             triangles_list: List of arrays `[T_i,3,2]`.
@@ -106,7 +104,7 @@ class PolyEncoderPipeline:
 
     @torch.no_grad()
     def image_to_embedding(self, imgs: torch.Tensor) -> torch.Tensor:
-        """Extract cls-token embedding from channel images.
+        """Extract one dense embedding slice from channel images.
 
         Args:
             imgs: Input tensor `[B,3,H,W]`.
@@ -122,7 +120,7 @@ class PolyEncoderPipeline:
         imgs = imgs.to(device=self.device, dtype=torch.float32)
         with autocast_context(self.device, self.precision):
             encoder_features = self.encoder(imgs)
-        return encoder_features[:, :, :].float()
+        return encoder_features[:, 0, :].float()
 
     @torch.no_grad()
     def triangles_to_embedding(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
@@ -161,11 +159,11 @@ class PolyEncoderPipeline:
         return torch.cat([emb, meta_tensor], dim=1)
 
 
-class PolyMaeReconstructionPipeline:
-    """MAE reconstruction pipeline for polygon vectors.
+class PolyAeReconstructionPipeline:
+    """AE reconstruction pipeline for polygon vectors.
 
     Args:
-        weight_path: Full MAE checkpoint path.
+        weight_path: Full AE checkpoint path.
         config_path: Config path from checkpoint directory.
         device: Runtime device string.
         precision: Runtime precision (`fp32`, `bf16`, `fp16`).
@@ -182,7 +180,7 @@ class PolyMaeReconstructionPipeline:
         self.device = torch.device(device)
         self.precision = normalize_precision(precision)
 
-        self.model, self.config = load_mae_model(
+        self.model, self.config = load_ae_model(
             weight_path=weight_path,
             config_path=config_path,
             device=self.device,
@@ -208,7 +206,7 @@ class PolyMaeReconstructionPipeline:
         return self.codec.triangulate_polygon(poly_norm)
 
     def triangles_to_images(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
-        """Convert triangle arrays to MAE input channels.
+        """Convert triangle arrays to AE input channels.
 
         Args:
             triangles_list: List of arrays `[T_i,3,2]`.
@@ -221,17 +219,14 @@ class PolyMaeReconstructionPipeline:
         return torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
 
     @torch.no_grad()
-    def reconstruct_real_imag(self, geometries: Sequence[np.ndarray], mask_ratio: float = 0.75):
-        """Run MAE reconstruction and return complex spectrum parts.
+    def reconstruct_real_imag(self, geometries: Sequence[np.ndarray]):
+        """Run AE reconstruction and return complex spectrum parts.
 
         Args:
             geometries: Sequence of polygon arrays.
-            mask_ratio: MAE mask ratio.
-
         Returns:
             Tuple `(real_part, imag_part)` with shape `[B,valid_h,valid_w]`.
         """
-        mask_ratio = self.model._validate_mask_ratio(mask_ratio)
         tri_list = []
         for geom in geometries:
             geom_np = ensure_polygon_array(geom)
@@ -240,10 +235,9 @@ class PolyMaeReconstructionPipeline:
         imgs = self.triangles_to_images(tri_list)
 
         with autocast_context(self.device, self.precision):
-            pred, mask_seq = self.model(imgs, mask_ratio=mask_ratio)
+            pred = self.model(imgs)
 
         pred = pred.float()
-        mask_seq = mask_seq.float()
 
         patch_size = int(self.config.get("patch_size", 2))
         batch_size, _, h, w = imgs.shape
@@ -251,16 +245,7 @@ class PolyMaeReconstructionPipeline:
 
         pred_img = pred.reshape(batch_size, h_p, w_p, 3, patch_size, patch_size)
         pred_img = torch.einsum("nhwcpq->nchpwq", pred_img).reshape(batch_size, 3, h, w)
-
-        mask_map = mask_seq.reshape(batch_size, h_p, w_p, 1, 1).expand(-1, -1, -1, patch_size, patch_size)
-        mask_map = mask_map.permute(0, 1, 3, 2, 4).reshape(batch_size, 1, h, w)
-
-        loss_mode = str(self.config.get("loss_mode", "mask")).lower()
-        if loss_mode == "full":
-            recon_imgs = pred_img
-        else:
-            recon_imgs = imgs * (1 - mask_map) + pred_img * mask_map
-        recon_valid = recon_imgs[:, :, : self.valid_h, : self.valid_w]
+        recon_valid = pred_img[:, :, : self.valid_h, : self.valid_w]
 
         mag_valid = recon_valid[:, 0, :, :]
         cos_valid = recon_valid[:, 1, :, :]
@@ -274,14 +259,16 @@ class PolyMaeReconstructionPipeline:
         return real_part, imag_part
 
     @torch.no_grad()
-    def vector_reconstruct(self, geometries: Sequence[np.ndarray], mask_ratio: float = 0.75):
+    def vector_reconstruct(self, geometries: Sequence[np.ndarray]):
         """Alias API for reconstruction.
 
         Args:
             geometries: Sequence of polygon arrays.
-            mask_ratio: MAE mask ratio.
-
         Returns:
             Tuple `(real_part, imag_part)`.
         """
-        return self.reconstruct_real_imag(geometries, mask_ratio=mask_ratio)
+        return self.reconstruct_real_imag(geometries)
+
+
+# Legacy alias kept for copied downstream code during migration.
+PolyMaeReconstructionPipeline = PolyAeReconstructionPipeline
