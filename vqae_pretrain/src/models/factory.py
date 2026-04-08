@@ -83,7 +83,6 @@ def build_vqae_model_from_config(
         num_heads=int(config.get("num_heads", 8)),
         mlp_ratio=float(config.get("mlp_ratio", 4.0)),
         drop_rate=float(config.get("drop_rate", 0.0)),
-        drop_path_rate=float(config.get("drop_path_rate", 0.0)),
         decoder_stage_channels=decoder_stage_channels,
         decoder_attention_type=str(config.get("decoder_attention_type", "window")),
         decoder_attention_heads=decoder_attention_heads,
@@ -163,7 +162,6 @@ def load_pretrained_encoder(
         num_heads=int(config.get("num_heads", 8)),
         mlp_ratio=float(config.get("mlp_ratio", 4.0)),
         drop_rate=float(config.get("drop_rate", 0.0)),
-        drop_path_rate=float(config.get("drop_path_rate", 0.0)),
     )
 
     raw_state_dict = torch.load(weight_path, map_location="cpu", weights_only=False)

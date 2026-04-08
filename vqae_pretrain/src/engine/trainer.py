@@ -72,7 +72,6 @@ _RESUME_LOCKED_KEYS = {
     "num_heads",
     "mlp_ratio",
     "drop_rate",
-    "drop_path_rate",
     "decoder_stage_channels",
     "decoder_attention_type",
     "decoder_attention_heads",
@@ -287,19 +286,9 @@ def plot_reconstruction(
     plt.close()
 
 
-def _build_model_config(args, img_size: tuple[int, int]) -> dict:
-    """Build persisted model config dict for downstream reload.
-
-    Args:
-        args: Parsed training arguments.
-        img_size: Runtime image size inferred from Fourier grid.
-
-    Returns:
-        Serializable model config dict.
-    """
+def _build_model_kwargs(args, img_size: tuple[int, int]) -> dict:
+    """Build one shared VQAE model-kwargs dict from runtime args."""
     return {
-        "geom_type": args.geom_type,
-        "train_type": args.train_type,
         "img_size": img_size,
         "in_chans": 3,
         "stem_channels": args.stem_channels,
@@ -309,7 +298,6 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
         "num_heads": args.num_heads,
         "mlp_ratio": args.mlp_ratio,
         "drop_rate": args.drop_rate,
-        "drop_path_rate": args.drop_path_rate,
         "decoder_stage_channels": args.decoder_stage_channels,
         "decoder_attention_type": args.decoder_attention_type,
         "decoder_attention_heads": args.decoder_attention_heads,
@@ -324,6 +312,23 @@ def _build_model_config(args, img_size: tuple[int, int]) -> dict:
         "vq_decay": args.vq_decay,
         "vq_eps": args.vq_eps,
         "vq_dead_code_threshold": args.vq_dead_code_threshold,
+    }
+
+
+def _build_model_config(args, img_size: tuple[int, int]) -> dict:
+    """Build persisted model config dict for downstream reload.
+
+    Args:
+        args: Parsed training arguments.
+        img_size: Runtime image size inferred from Fourier grid.
+
+    Returns:
+        Serializable model config dict.
+    """
+    return {
+        "geom_type": args.geom_type,
+        "train_type": args.train_type,
+        **_build_model_kwargs(args, img_size=img_size),
         "pos_freqs": args.pos_freqs,
         "w_min": args.w_min,
         "w_max": args.w_max,
@@ -343,36 +348,7 @@ def _build_model(args, img_size: tuple[int, int], device: torch.device, dist_ctx
     Returns:
         Model instance (possibly DDP-wrapped).
     """
-    model = build_vqae_model_from_config(
-        {
-            "img_size": img_size,
-            "in_chans": 3,
-            "stem_channels": args.stem_channels,
-            "stem_strides": args.stem_strides,
-            "embed_dim": args.embed_dim,
-            "depth": args.depth,
-            "num_heads": args.num_heads,
-            "mlp_ratio": args.mlp_ratio,
-            "drop_rate": args.drop_rate,
-            "drop_path_rate": args.drop_path_rate,
-            "decoder_stage_channels": args.decoder_stage_channels,
-            "decoder_attention_type": args.decoder_attention_type,
-            "decoder_attention_heads": args.decoder_attention_heads,
-            "decoder_attention_depths": args.decoder_attention_depths,
-            "decoder_conv_depths": args.decoder_conv_depths,
-            "decoder_window_size": args.decoder_window_size,
-            "decoder_upsample_mode": args.decoder_upsample_mode,
-            "decoder_mlp_ratio": args.decoder_mlp_ratio,
-            "decoder_drop_rate": args.decoder_drop_rate,
-            "codebook_size": args.codebook_size,
-            "code_dim": args.code_dim,
-            "vq_decay": args.vq_decay,
-            "vq_eps": args.vq_eps,
-            "vq_dead_code_threshold": args.vq_dead_code_threshold,
-        },
-        device=device,
-        precision="fp32",
-    )
+    model = build_vqae_model_from_config(_build_model_kwargs(args, img_size=img_size), device=device, precision="fp32")
 
     if dist_ctx.enabled and dist_ctx.world_size > 1:
         if device.type == "cuda":
@@ -770,6 +746,13 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
     persistent_workers = bool(args.num_workers > 0 and args.load_mode == "lazy")
 
     use_distributed_sampler = dist_ctx.enabled and dist_ctx.world_size > 1
+    common_loader_kwargs = {
+        "batch_size": args.batch_size,
+        "collate_fn": triangle_collate_fn,
+        "num_workers": args.num_workers,
+        "pin_memory": True,
+        "persistent_workers": persistent_workers,
+    }
 
     if use_distributed_sampler:
         train_sampler = DistributedSampler(train_dataset)
@@ -777,41 +760,25 @@ def _build_loaders(args, train_dataset, val_dataset, dist_ctx: DistContext):
 
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             sampler=train_sampler,
-            collate_fn=triangle_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size,
             sampler=val_sampler,
-            collate_fn=triangle_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
     else:
         train_sampler = None
         train_loader = DataLoader(
             train_dataset,
-            batch_size=args.batch_size,
             shuffle=True,
-            collate_fn=triangle_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=args.batch_size,
             shuffle=False,
-            collate_fn=triangle_collate_fn,
-            num_workers=args.num_workers,
-            pin_memory=True,
-            persistent_workers=persistent_workers,
+            **common_loader_kwargs,
         )
 
     return train_dataset, val_dataset, train_loader, val_loader, train_sampler
@@ -843,6 +810,174 @@ def _prepare_fixed_visual_sample(args, codec, val_dataset, device: torch.device)
         spatial_gt = rasterize_tris_to_grid(fixed_tris.cpu(), h_sp, w_sp)
 
     return fixed_batch_tris, fixed_lengths, spatial_gt, spatial_icft_orig
+
+
+def _accumulate_epoch_metrics(metric_sums: dict[str, float], step_outputs: dict[str, torch.Tensor]) -> None:
+    """Accumulate scalar metrics from one model step into running sums."""
+    metric_sums["total"] += float(step_outputs["loss_total"].item())
+    metric_sums["mag"] += float(step_outputs["loss_mag"].item())
+    metric_sums["phase"] += float(step_outputs["loss_phase"].item())
+    metric_sums["vq"] += float(step_outputs["weighted_vq"].item())
+    metric_sums["perplexity"] += float(step_outputs["outputs"].perplexity.item())
+    metric_sums["active"] += float(step_outputs["outputs"].active_codes.item())
+
+
+def _reduce_epoch_metrics(
+    metric_sums: dict[str, float],
+    steps: int,
+    *,
+    device: torch.device,
+    dist_ctx: DistContext,
+) -> dict[str, torch.Tensor]:
+    """Average and all-reduce one epoch metric bundle."""
+    step_count = max(1, int(steps))
+    return {
+        name: all_reduce_mean(torch.tensor(value / step_count, device=device), dist_ctx)
+        for name, value in metric_sums.items()
+    }
+
+
+def _format_epoch_metrics(prefix: str, metrics: dict[str, torch.Tensor]) -> str:
+    """Format one train/val epoch metric line."""
+    return (
+        f"  [{prefix}] Total: {metrics['total'].item():.4f} | "
+        f"Mag: {metrics['mag'].item():.4f} | Phase: {metrics['phase'].item():.4f} | "
+        f"VQ: {metrics['vq'].item():.4f} | Perplexity: {metrics['perplexity'].item():.2f} | "
+        f"ActiveCodes: {int(metrics['active'].item())}"
+    )
+
+
+def _save_fixed_visualization(
+    *,
+    model,
+    codec,
+    fixed_batch_tris: torch.Tensor,
+    fixed_lengths: torch.Tensor,
+    spatial_gt,
+    spatial_icft_orig: torch.Tensor,
+    device: torch.device,
+    precision: str,
+    use_vq: bool,
+    epoch: int,
+    save_dir: Path,
+) -> None:
+    """Render and save one fixed validation visualization snapshot."""
+    with torch.no_grad():
+        mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
+        imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
+
+        with autocast_context(device, precision):
+            outputs_fix = model(imgs_fix, use_vq=use_vq)
+
+        img_orig = imgs_fix[0].cpu()
+        img_masked = img_orig.clone()
+        img_recon = outputs_fix.recon_imgs[0].float().cpu()
+
+        mag_recon = img_recon[0].unsqueeze(0).to(device)
+        cos_recon = img_recon[1].unsqueeze(0).to(device)
+        sin_recon = img_recon[2].unsqueeze(0).to(device)
+
+        phase_recon = torch.atan2(sin_recon, cos_recon)
+        real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
+        spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
+
+        plot_reconstruction(
+            img_orig=img_orig,
+            img_masked=img_masked,
+            img_recon=img_recon,
+            spatial_gt=spatial_gt,
+            spatial_icft_orig=spatial_icft_orig.squeeze(),
+            spatial_icft_recon=spatial_icft_recon,
+            epoch=epoch + 1,
+            save_dir=save_dir,
+        )
+
+
+def _build_nonfinite_tensor_map(
+    *,
+    stage: str,
+    imgs: torch.Tensor,
+    recon_imgs: torch.Tensor,
+    loss_mag: torch.Tensor,
+    loss_phase: torch.Tensor,
+    vq_loss: torch.Tensor,
+    loss_total: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Build one standardized tensor bundle for non-finite diagnostics."""
+    suffix = "_val" if stage == "val_loss" else ""
+    return {
+        f"imgs{suffix}": imgs,
+        f"recon_imgs{suffix}": recon_imgs,
+        f"loss_mag{suffix}": loss_mag,
+        f"loss_phase{suffix}": loss_phase,
+        f"loss_vq{suffix}": vq_loss,
+        f"loss_total{suffix}": loss_total,
+    }
+
+
+def _run_model_step(
+    *,
+    model,
+    codec,
+    batch_tris,
+    lengths,
+    device: torch.device,
+    precision: str,
+    use_vq: bool,
+    freq_span_map: torch.Tensor,
+    args,
+    current_vq_beta: float,
+    epoch: int,
+    step: int,
+    stage: str,
+) -> dict[str, torch.Tensor]:
+    """Run one shared forward+loss step for both train and validation."""
+    with torch.no_grad():
+        mag, phase = codec.cft_batch(batch_tris, lengths)
+        imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
+
+    with autocast_context(device, precision):
+        outputs = model(imgs, use_vq=use_vq)
+
+    recon_imgs = outputs.recon_imgs.float()
+    vq_loss = outputs.vq_loss.float()
+
+    loss_mag, loss_phase = compute_mag_phase_losses(
+        pred_imgs=recon_imgs,
+        target_imgs=imgs.float(),
+        freq_span_map=freq_span_map,
+        weight_mag_hf=args.weight_mag_hf,
+    )
+    recon_loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
+    weighted_vq = current_vq_beta * vq_loss
+    loss_total = recon_loss + weighted_vq
+
+    if not bool(torch.isfinite(loss_total).item()):
+        _raise_nonfinite_training_error(
+            stage=stage,
+            epoch=epoch,
+            step=step,
+            tensors=_build_nonfinite_tensor_map(
+                stage=stage,
+                imgs=imgs,
+                recon_imgs=recon_imgs,
+                loss_mag=loss_mag,
+                loss_phase=loss_phase,
+                vq_loss=vq_loss,
+                loss_total=loss_total,
+            ),
+        )
+
+    return {
+        "imgs": imgs,
+        "outputs": outputs,
+        "recon_imgs": recon_imgs,
+        "loss_mag": loss_mag,
+        "loss_phase": loss_phase,
+        "vq_loss": vq_loss,
+        "weighted_vq": weighted_vq,
+        "loss_total": loss_total,
+    }
 
 def count_parameters(model):
     model = model.module if hasattr(model, 'module') else model
@@ -1097,7 +1232,14 @@ def train_main(args) -> None:
                 distributed_barrier(dist_ctx)
 
             model.train()
-            train_total = train_mag = train_phase = train_vq = train_perplexity = train_active = 0.0
+            train_metric_sums = {
+                "total": 0.0,
+                "mag": 0.0,
+                "phase": 0.0,
+                "vq": 0.0,
+                "perplexity": 0.0,
+                "active": 0.0,
+            }
             train_steps = 0
             start_time = time.time()
 
@@ -1108,40 +1250,22 @@ def train_main(args) -> None:
             for step, (batch_tris, lengths) in enumerate(train_loader):
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.no_grad():
-                    mag, phase = codec.cft_batch(batch_tris, lengths)
-                    imgs = torch.cat([mag, torch.cos(phase), torch.sin(phase)], dim=1)
-
-                with autocast_context(device, args.precision):
-                    outputs = model(imgs, use_vq=use_vq)
-
-                recon_imgs = outputs.recon_imgs.float()
-                vq_loss = outputs.vq_loss.float()
-
-                loss_mag, loss_phase = compute_mag_phase_losses(
-                    pred_imgs=recon_imgs,
-                    target_imgs=imgs.float(),
+                step_outputs = _run_model_step(
+                    model=model,
+                    codec=codec,
+                    batch_tris=batch_tris,
+                    lengths=lengths,
+                    device=device,
+                    precision=args.precision,
+                    use_vq=use_vq,
                     freq_span_map=freq_span_map,
-                    weight_mag_hf=args.weight_mag_hf,
+                    args=args,
+                    current_vq_beta=current_vq_beta,
+                    epoch=epoch,
+                    step=step,
+                    stage="train_loss",
                 )
-                recon_loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
-                weighted_vq = current_vq_beta * vq_loss
-                loss = recon_loss + weighted_vq
-
-                if not bool(torch.isfinite(loss).item()):
-                    _raise_nonfinite_training_error(
-                        stage="train_loss",
-                        epoch=epoch,
-                        step=step,
-                        tensors={
-                            "imgs": imgs,
-                            "recon_imgs": recon_imgs,
-                            "loss_mag": loss_mag,
-                            "loss_phase": loss_phase,
-                            "loss_vq": vq_loss,
-                            "loss_total": loss,
-                        },
-                    )
+                loss = step_outputs["loss_total"]
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
@@ -1152,146 +1276,96 @@ def train_main(args) -> None:
                     loss.backward()
                     optimizer.step()
 
-                train_total += float(loss.item())
-                train_mag += float(loss_mag.item())
-                train_phase += float(loss_phase.item())
-                train_vq += float(weighted_vq.item())
-                train_perplexity += float(outputs.perplexity.item())
-                train_active += float(outputs.active_codes.item())
+                _accumulate_epoch_metrics(train_metric_sums, step_outputs)
                 train_steps += 1
 
                 if is_main_process(dist_ctx) and step % args.log_interval == 0:
                     print(
                         f"  -> Step [{step}/{len(train_loader)}], "
-                        f"Train Loss: {loss.item():.4f}, VQ: {weighted_vq.item():.4f}, "
-                        f"Perplexity: {outputs.perplexity.item():.2f}, ActiveCodes: {int(outputs.active_codes.item())}"
+                        f"Train Loss: {loss.item():.4f}, VQ: {step_outputs['weighted_vq'].item():.4f}, "
+                        f"Perplexity: {step_outputs['outputs'].perplexity.item():.2f}, "
+                        f"ActiveCodes: {int(step_outputs['outputs'].active_codes.item())}"
                     )
 
                 if max_train_steps > 0 and train_steps >= max_train_steps:
                     break
 
-            avg_train_loss = all_reduce_mean(torch.tensor(train_total / max(1, train_steps), device=device), dist_ctx)
-            avg_train_mag = all_reduce_mean(torch.tensor(train_mag / max(1, train_steps), device=device), dist_ctx)
-            avg_train_phase = all_reduce_mean(torch.tensor(train_phase / max(1, train_steps), device=device), dist_ctx)
-            avg_train_vq = all_reduce_mean(torch.tensor(train_vq / max(1, train_steps), device=device), dist_ctx)
-            avg_train_perplexity = all_reduce_mean(
-                torch.tensor(train_perplexity / max(1, train_steps), device=device), dist_ctx
+            train_metrics = _reduce_epoch_metrics(
+                train_metric_sums,
+                train_steps,
+                device=device,
+                dist_ctx=dist_ctx,
             )
-            avg_train_active = all_reduce_mean(torch.tensor(train_active / max(1, train_steps), device=device), dist_ctx)
 
             should_eval = _is_eval_epoch(epoch, total_epochs=args.epochs, eval_every=args.eval_every)
-            avg_val_loss = avg_val_mag = avg_val_phase = avg_val_vq = avg_val_perplexity = avg_val_active = None
+            val_metrics = None
 
             if should_eval:
                 model.eval()
-                val_total = val_mag = val_phase = val_vq = val_perplexity = val_active = 0.0
+                val_metric_sums = {
+                    "total": 0.0,
+                    "mag": 0.0,
+                    "phase": 0.0,
+                    "vq": 0.0,
+                    "perplexity": 0.0,
+                    "active": 0.0,
+                }
                 val_steps = 0
 
                 with torch.no_grad():
                     for _, (val_batch_tris, val_lengths) in enumerate(val_loader):
-                        mag_v, phase_v = codec.cft_batch(val_batch_tris, val_lengths)
-                        imgs_v = torch.cat([mag_v, torch.cos(phase_v), torch.sin(phase_v)], dim=1)
-
-                        with autocast_context(device, args.precision):
-                            outputs_v = model(imgs_v, use_vq=use_vq)
-
-                        recon_imgs_v = outputs_v.recon_imgs.float()
-                        vq_loss_v = outputs_v.vq_loss.float()
-
-                        loss_mag_v, loss_phase_v = compute_mag_phase_losses(
-                            pred_imgs=recon_imgs_v,
-                            target_imgs=imgs_v.float(),
+                        step_outputs = _run_model_step(
+                            model=model,
+                            codec=codec,
+                            batch_tris=val_batch_tris,
+                            lengths=val_lengths,
+                            device=device,
+                            precision=args.precision,
+                            use_vq=use_vq,
                             freq_span_map=freq_span_map,
-                            weight_mag_hf=args.weight_mag_hf,
+                            args=args,
+                            current_vq_beta=current_vq_beta,
+                            epoch=epoch,
+                            step=val_steps,
+                            stage="val_loss",
                         )
-
-                        recon_loss_v = args.weight_mag * loss_mag_v + args.weight_phase * loss_phase_v
-                        weighted_vq_v = current_vq_beta * vq_loss_v
-                        loss_total_v = recon_loss_v + weighted_vq_v
-                        if not bool(torch.isfinite(loss_total_v).item()):
-                            _raise_nonfinite_training_error(
-                                stage="val_loss",
-                                epoch=epoch,
-                                step=val_steps,
-                                tensors={
-                                    "imgs_val": imgs_v,
-                                    "recon_imgs_val": recon_imgs_v,
-                                    "loss_mag_val": loss_mag_v,
-                                    "loss_phase_val": loss_phase_v,
-                                    "loss_vq_val": vq_loss_v,
-                                    "loss_total_val": loss_total_v,
-                                },
-                            )
-                        val_total += float(loss_total_v.item())
-                        val_mag += float(loss_mag_v.item())
-                        val_phase += float(loss_phase_v.item())
-                        val_vq += float(weighted_vq_v.item())
-                        val_perplexity += float(outputs_v.perplexity.item())
-                        val_active += float(outputs_v.active_codes.item())
+                        _accumulate_epoch_metrics(val_metric_sums, step_outputs)
                         val_steps += 1
 
                         if max_val_steps > 0 and val_steps >= max_val_steps:
                             break
 
-                avg_val_loss = all_reduce_mean(torch.tensor(val_total / max(1, val_steps), device=device), dist_ctx)
-                avg_val_mag = all_reduce_mean(torch.tensor(val_mag / max(1, val_steps), device=device), dist_ctx)
-                avg_val_phase = all_reduce_mean(torch.tensor(val_phase / max(1, val_steps), device=device), dist_ctx)
-                avg_val_vq = all_reduce_mean(torch.tensor(val_vq / max(1, val_steps), device=device), dist_ctx)
-                avg_val_perplexity = all_reduce_mean(
-                    torch.tensor(val_perplexity / max(1, val_steps), device=device), dist_ctx
+                val_metrics = _reduce_epoch_metrics(
+                    val_metric_sums,
+                    val_steps,
+                    device=device,
+                    dist_ctx=dist_ctx,
                 )
-                avg_val_active = all_reduce_mean(torch.tensor(val_active / max(1, val_steps), device=device), dist_ctx)
 
             current_lr = optimizer.param_groups[0]["lr"]
 
             if is_main_process(dist_ctx):
                 print(f"Epoch {epoch + 1} Completed in {time.time() - start_time:.2f}s | LR: {current_lr:.2e}")
-                print(
-                    f"  [Train] Total: {avg_train_loss.item():.4f} | "
-                    f"Mag: {avg_train_mag.item():.4f} | Phase: {avg_train_phase.item():.4f} | "
-                    f"VQ: {avg_train_vq.item():.4f} | Perplexity: {avg_train_perplexity.item():.2f} | "
-                    f"ActiveCodes: {int(avg_train_active.item())}"
+                print(_format_epoch_metrics("Train", train_metrics))
+                if should_eval and val_metrics is not None:
+                    print(_format_epoch_metrics("Val", val_metrics))
+
+            if should_eval and is_main_process(dist_ctx) and val_metrics is not None:
+                _save_fixed_visualization(
+                    model=model,
+                    codec=codec,
+                    fixed_batch_tris=fixed_batch_tris,
+                    fixed_lengths=fixed_lengths,
+                    spatial_gt=spatial_gt,
+                    spatial_icft_orig=spatial_icft_orig,
+                    device=device,
+                    precision=args.precision,
+                    use_vq=use_vq,
+                    epoch=epoch,
+                    save_dir=viz_dir,
                 )
-                if should_eval and avg_val_loss is not None:
-                    print(
-                        f"  [Val]   Total: {avg_val_loss.item():.4f} | "
-                        f"Mag: {avg_val_mag.item():.4f} | Phase: {avg_val_phase.item():.4f} | "
-                        f"VQ: {avg_val_vq.item():.4f} | Perplexity: {avg_val_perplexity.item():.2f} | "
-                        f"ActiveCodes: {int(avg_val_active.item())}"
-                    )
 
-            if should_eval and is_main_process(dist_ctx):
-                with torch.no_grad():
-                    mag_fix, phase_fix = codec.cft_batch(fixed_batch_tris, fixed_lengths)
-                    imgs_fix = torch.cat([mag_fix, torch.cos(phase_fix), torch.sin(phase_fix)], dim=1)
-
-                    with autocast_context(device, args.precision):
-                        outputs_fix = model(imgs_fix, use_vq=use_vq)
-
-                    img_orig = imgs_fix[0].cpu()
-                    img_masked = img_orig.clone()
-                    img_recon = outputs_fix.recon_imgs[0].float().cpu()
-
-                    mag_recon = img_recon[0].unsqueeze(0).to(device)
-                    cos_recon = img_recon[1].unsqueeze(0).to(device)
-                    sin_recon = img_recon[2].unsqueeze(0).to(device)
-
-                    phase_recon = torch.atan2(sin_recon, cos_recon)
-                    real_recon, imag_recon = mag_phase_to_real_imag(mag_recon, phase_recon)
-                    spatial_icft_recon = codec.icft_2d(real_recon, imag_recon)[0].squeeze().cpu()
-
-                    plot_reconstruction(
-                        img_orig=img_orig,
-                        img_masked=img_masked,
-                        img_recon=img_recon,
-                        spatial_gt=spatial_gt,
-                        spatial_icft_orig=spatial_icft_orig.squeeze(),
-                        spatial_icft_recon=spatial_icft_recon,
-                        epoch=epoch + 1,
-                        save_dir=viz_dir,
-                    )
-
-                current_val_loss = float(avg_val_loss.item())
+                current_val_loss = float(val_metrics["total"].item())
                 if current_val_loss < best_val_loss:
                     best_val_loss = current_val_loss
                     save_checkpoint(best_dir / "vqae_best.pth", model_to_save.state_dict(), precision=args.checkpoint_dtype)
@@ -1384,7 +1458,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_heads", type=int, default=8)
     parser.add_argument("--mlp_ratio", type=float, default=4.0)
     parser.add_argument("--drop_rate", type=float, default=0.0)
-    parser.add_argument("--drop_path_rate", type=float, default=0.0)
 
     parser.add_argument("--decoder_stage_channels", type=str, default="256,192,128")
     parser.add_argument("--decoder_attention_type", type=str, default="window", choices=("none", "window", "global"))

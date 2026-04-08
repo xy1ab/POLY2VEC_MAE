@@ -90,8 +90,6 @@ class PolyEncoder(nn.Module):
         num_heads: ViT neck attention head count.
         mlp_ratio: ViT MLP expansion ratio.
         drop_rate: Token dropout probability.
-        drop_path_rate: Reserved for future use. Currently kept for config/API
-            compatibility and ignored by the local lightweight ViT blocks.
     """
 
     def __init__(
@@ -105,10 +103,8 @@ class PolyEncoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         drop_rate: float = 0.0,
-        drop_path_rate: float = 0.0,
     ) -> None:
         super().__init__()
-        del drop_path_rate
 
         self.img_size = (int(img_size[0]), int(img_size[1]))
         self.in_chans = int(in_chans)

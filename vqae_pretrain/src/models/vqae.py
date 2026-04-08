@@ -50,7 +50,6 @@ class PolyVqAutoencoder(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         drop_rate: float = 0.0,
-        drop_path_rate: float = 0.0,
         decoder_stage_channels: Sequence[int] = (256, 192, 128),
         decoder_attention_type: str = "window",
         decoder_attention_heads: Sequence[int] = (8, 4, 4),
@@ -82,7 +81,6 @@ class PolyVqAutoencoder(nn.Module):
             num_heads=num_heads,
             mlp_ratio=mlp_ratio,
             drop_rate=drop_rate,
-            drop_path_rate=drop_path_rate,
         )
 
         upsample_scales = list(self.encoder.stem.stage_strides[::-1])
@@ -140,7 +138,7 @@ class PolyVqAutoencoder(nn.Module):
         """Initialize the EMA codebook from one set of latent vectors."""
         self.quantizer.initialize_codebook(vectors=vectors, num_iters=num_iters)
 
-    def forward_image(self, imgs: torch.Tensor, use_vq: bool = True) -> VqAeForwardOutput:
+    def forward(self, imgs: torch.Tensor, use_vq: bool = True) -> VqAeForwardOutput:
         """Run full-image VQAE forward pass.
 
         During AE warmup, `use_vq=False` bypasses the quantizer while keeping the
@@ -172,7 +170,3 @@ class PolyVqAutoencoder(nn.Module):
             indices=indices,
             using_vq=bool(use_vq),
         )
-
-    def forward(self, imgs: torch.Tensor, use_vq: bool = True) -> VqAeForwardOutput:
-        """Run the full VQAE and return structured outputs."""
-        return self.forward_image(imgs=imgs, use_vq=use_vq)

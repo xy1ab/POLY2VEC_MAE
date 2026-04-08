@@ -98,8 +98,6 @@ num_heads: 4
 mlp_ratio: 4.0
 # 普通 dropout 概率。重建任务通常保持为 0 或很小。
 drop_rate: 0.0
-# stochastic depth 概率。较深模型可适当增大，小模型通常保持很小。
-drop_path_rate: 0.0
 
 # =========================
 # 解码器（多 stage attention + conv）
