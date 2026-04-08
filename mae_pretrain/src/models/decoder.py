@@ -27,14 +27,12 @@ class TransUNetdecoder(nn.Module):
             encoder_channels=(0, 0, 0, 0, 512), 
             decoder_channels=(256, 128, 64, 32, 16),
             n_blocks=5,
-            use_batchnorm=True,
-            center=True, # 增加中心卷积块以增强 Bottleneck 表达
         )
 
         # 3. 输出头 (Segmentation Head)
         # 最后输出 256x256，这里设置 upsampling=2 配合 decoder 内部的 4 倍
         self.segmentation_head = smp.base.SegmentationHead(
-            in_channels=16, 
+            in_channels=32, 
             out_channels=out_ch, 
             activation=None, # 训练建议：输出 Logits，配合 BCEWithLogitsLoss
             kernel_size=3
@@ -50,17 +48,21 @@ class TransUNetdecoder(nn.Module):
             cls_feat = self.cls_proj(x[:, 0, :]).unsqueeze(-1).unsqueeze(-1)
             
             # spatial_patches: [B, 512, 1024] -> [B, 1024, 32, 16]
-            x_spatial = x[:, 1:, :].transpose(1, 2).reshape(B, C, 32, 16)
+            x_spatial = x[:, 1:, :].transpose(1, 2).contiguous().reshape(B, C, 32, 16)
             x_spatial = self.spatial_proj(x_spatial) # [B, 512, 32, 16]
             
             # 全局语义与局部空间特征相加融合
-            features = x_spatial + cls_feat 
-            
+            x_spatial = x_spatial + cls_feat 
+            d1 = torch.zeros(B, 0, 512, 256).to(x.device)
+            d2 = torch.zeros(B, 0, 256, 128).to(x.device)
+            d3 = torch.zeros(B, 0, 128, 64).to(x.device)
+            d4 = torch.zeros(B, 0, 64, 32).to(x.device)
+            features = [d1, d2, d3, d4, x_spatial]
             # --- 建议 2: 纯 Decoder 解码 ---
             # 此时 features 是最底层的 Bottleneck 特征
             # 经过 5 层上采样：(32x16) -> (64x32) -> (128x64) -> (256x128) -> (512x256) -> (1024x512)
             # 注意：smp 默认每层放大2倍，所以我们需要控制上采样步数
-            decoder_output = self.decoder(None, None, None, None, features)
+            decoder_output = self.decoder(features)
             
             # --- 建议 3: 尺寸对齐与 Logits 输出 ---
             logits = self.segmentation_head(decoder_output)
@@ -71,7 +73,7 @@ class TransUNetdecoder(nn.Module):
                     logits, size=(256, 256), mode='bilinear', align_corners=True
                 )
                 
-            return logits
+            return logits # 输出 [B, 256, 256]
 if __name__ == '__main__':
     pass
 

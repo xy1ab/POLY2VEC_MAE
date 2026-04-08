@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 # -*- encoding: utf-8 -*-
 '''
-@File    :   run_reconstruction.py
+@File    :   run_reconstruction_musa.py
 @Time    :   2026/04/07 14:34:03
 @Author  :   Hu Bin 
 @Version :   1.0
 @Desc    :   None
 '''
+import torch_musa
 import torch
 import argparse
 from pathlib import Path
@@ -91,9 +92,10 @@ def rasterize_triangles_pytorch(batch_tris, spatial_size=256):
 def _default_device() -> str:
     """Resolve default runtime device string."""
     try:
+        import torch_musa
         import torch
 
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        return "musa" if torch.musa.is_available() else "cpu"
     except Exception:
         return "cpu"
 
@@ -206,15 +208,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
     )
-    # parser.add_argument("--model_dir", type=str, required=True, help="Directory containing encoder/MAE checkpoints and config.")
-    # parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
-    parser.add_argument("--model_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/ckpt/", help="Directory containing encoder/MAE checkpoints and config.")
-    parser.add_argument("--data_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/data/processed/", help="Directory containing triangulated shard `.pt` files.")
+    parser.add_argument("--model_dir", type=str, required=True, help="Directory containing encoder/MAE checkpoints and config.")
+    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
     parser.add_argument("--output_path", type=str, default="", help="Output `.pt` file path.")
     parser.add_argument("--save_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/unet_checkpoints", help="Output `.pt` file path.")
     parser.add_argument("--train_data_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/mae_pretrain/outputs/forward_batch/processed_forward_batch_20260407_174737.pt", help="Output `.pt` file path.")
     parser.add_argument("--batch_size", type=int, default=64, help="Inference batch size.")
-    parser.add_argument("--device", type=str, default=_default_device(), help="Runtime device, e.g. cuda or cpu.")
+    parser.add_argument("--device", type=str, default=_default_device(), help="Runtime device, e.g. musa or cpu.")
     parser.add_argument("--precision", type=str, default="fp32", help="Runtime precision: fp32/bf16/fp16.")
     parser.add_argument("--max_samples", type=int, default=0, help="Optional export cap; 0 means all samples.")
     parser.add_argument("--epoch", type=int, default=1000, help="Optional export cap; 0 means all samples.")
@@ -223,7 +223,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def getdata(args) -> None:
     """CLI main entrypoint."""
     project_root = _inject_repo_root()
-
 
     args.precision = normalize_precision(args.precision)
     if args.batch_size <= 0:
@@ -237,8 +236,8 @@ def getdata(args) -> None:
     ensure_dir(output_path.parent)
 
     requested_device = args.device or _default_device()
-    if str(requested_device).startswith("cuda") and not torch.cuda.is_available():
-        print("[WARN] CUDA unavailable, fallback to CPU for forward export.")
+    if str(requested_device).startswith("musa") and not torch.musa.is_available():
+        print("[WARN] MUSA unavailable, fallback to CPU for forward export.")
         requested_device = "cpu"
     device = torch.device(requested_device)
 
@@ -406,11 +405,11 @@ def spectral_consistency_loss(pred, target):
 
 def train(args):
 
-    dist.init_process_group(backend='nccl')
+    dist.init_process_group(backend='mccl')
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = dist.get_world_size()
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f'cuda:{local_rank}')
+    torch.musa.set_device(local_rank)
+    device = torch.device(f'musa:{local_rank}')
 
     data = torch.load(args.train_data_path, map_location='cpu')
     meta_data = data['metadata']
