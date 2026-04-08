@@ -16,15 +16,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .norm_utils import group_count
 from .vit_block import Block
-
-
-def _group_count(num_channels: int) -> int:
-    """Choose a valid GroupNorm group count for one channel width."""
-    for groups in (32, 16, 8, 4, 2, 1):
-        if num_channels % groups == 0:
-            return groups
-    return 1
 
 
 class ConvRefineBlock(nn.Module):
@@ -32,10 +25,10 @@ class ConvRefineBlock(nn.Module):
 
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.norm1 = nn.GroupNorm(_group_count(channels), channels)
+        self.norm1 = nn.GroupNorm(group_count(channels), channels)
         self.act1 = nn.GELU()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.norm2 = nn.GroupNorm(_group_count(channels), channels)
+        self.norm2 = nn.GroupNorm(group_count(channels), channels)
         self.act2 = nn.GELU()
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, stride=1, padding=1, bias=False)
 
@@ -163,7 +156,7 @@ class UpsampleProject(nn.Module):
         self.scale = int(scale)
         self.mode = str(mode).lower()
         self.proj = nn.Conv2d(in_chans, out_chans, kernel_size=3, stride=1, padding=1, bias=False)
-        self.norm = nn.GroupNorm(_group_count(out_chans), out_chans)
+        self.norm = nn.GroupNorm(group_count(out_chans), out_chans)
         self.act = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

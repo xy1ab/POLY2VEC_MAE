@@ -17,16 +17,9 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
+from .norm_utils import group_count
 from .pos_embed import get_2d_sincos_pos_embed
 from .vit_block import Block
-
-
-def _group_count(num_channels: int) -> int:
-    """Choose a valid GroupNorm group count for one channel width."""
-    for groups in (32, 16, 8, 4, 2, 1):
-        if num_channels % groups == 0:
-            return groups
-    return 1
 
 
 class ConvStemStage(nn.Module):
@@ -35,10 +28,10 @@ class ConvStemStage(nn.Module):
     def __init__(self, in_chans: int, out_chans: int, stride: int) -> None:
         super().__init__()
         self.proj = nn.Conv2d(in_chans, out_chans, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.norm1 = nn.GroupNorm(_group_count(out_chans), out_chans)
+        self.norm1 = nn.GroupNorm(group_count(out_chans), out_chans)
         self.act1 = nn.GELU()
         self.refine = nn.Conv2d(out_chans, out_chans, kernel_size=3, stride=1, padding=1, bias=False)
-        self.norm2 = nn.GroupNorm(_group_count(out_chans), out_chans)
+        self.norm2 = nn.GroupNorm(group_count(out_chans), out_chans)
         self.act2 = nn.GELU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

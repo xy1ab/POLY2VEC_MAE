@@ -120,7 +120,7 @@ class EMAVectorQuantizer(nn.Module):
         return tensor
 
     def _broadcast_state_from_rank0(self) -> None:
-        """Synchronize EMA buffers after rank-0-only mutations."""
+        """Synchronize EMA buffers after one rank-only dead-code restart."""
         self._broadcast_in_place(self.codebook)
         self._broadcast_in_place(self.cluster_size)
         self._broadcast_in_place(self.embed_avg)
@@ -158,15 +158,19 @@ class EMAVectorQuantizer(nn.Module):
         return torch.cat(index_chunks, dim=0)
 
     @torch.no_grad()
-    def _restart_dead_codes(self, vectors: torch.Tensor) -> None:
-        """Restart dead codes from current batch latent vectors."""
+    def _restart_dead_codes(self, vectors: torch.Tensor) -> bool:
+        """Restart dead codes from current batch latent vectors.
+
+        Returns:
+            Whether any dead-code restart was actually performed.
+        """
         if self.dead_code_threshold <= 0:
-            return
+            return False
 
         dead_mask = self.cluster_size < self.dead_code_threshold
         dead_count = int(dead_mask.sum().item())
         if dead_count == 0 or vectors.numel() == 0:
-            return
+            return False
 
         sample_count = min(dead_count, vectors.shape[0])
         perm = torch.randperm(vectors.shape[0], device=vectors.device)[:sample_count]
@@ -179,6 +183,7 @@ class EMAVectorQuantizer(nn.Module):
         self.codebook[dead_indices] = replacements
         self.embed_avg[dead_indices] = replacements
         self.cluster_size[dead_indices] = 1.0
+        return True
 
     @torch.no_grad()
     def initialize_codebook(self, vectors: torch.Tensor, num_iters: int = 10) -> None:
@@ -285,9 +290,11 @@ class EMAVectorQuantizer(nn.Module):
                     * total_count.clamp_min(1.0)
                 )
                 self.codebook.copy_(self.embed_avg / normalized_cluster_size.unsqueeze(1))
+                restarted_dead_codes = False
                 if self._is_main_rank():
-                    self._restart_dead_codes(vectors)
-                self._broadcast_state_from_rank0()
+                    restarted_dead_codes = self._restart_dead_codes(vectors)
+                if restarted_dead_codes:
+                    self._broadcast_state_from_rank0()
 
         return QuantizerOutput(
             quantized=quantized_st,

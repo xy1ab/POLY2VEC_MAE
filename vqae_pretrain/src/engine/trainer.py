@@ -154,9 +154,20 @@ def compute_freq_span_map(converter, device: torch.device) -> torch.Tensor:
     freq_span_map[:valid_h, :valid_w] = d_u * d_v
 
     freq_span_map = torch.sqrt(freq_span_map.clamp_min(0.0))
-    freq_span_map = freq_span_map / (freq_span_map.mean() + 1e-8)
+    valid_mean = freq_span_map[:valid_h, :valid_w].mean()
+    freq_span_map = freq_span_map / (valid_mean + 1e-8)
 
     return freq_span_map.unsqueeze(0).unsqueeze(0)
+
+
+def compute_valid_mask(converter, device: torch.device) -> torch.Tensor:
+    """Build one binary mask covering only valid non-padding frequency region."""
+    h, w = converter.U.shape
+    valid_h = h - converter.pad_h
+    valid_w = w - converter.pad_w
+    valid_mask = torch.zeros((h, w), dtype=torch.float32, device=device)
+    valid_mask[:valid_h, :valid_w] = 1.0
+    return valid_mask.unsqueeze(0).unsqueeze(0)
 
 
 def rasterize_tris_to_grid(tris: torch.Tensor, height: int, width: int) -> np.ndarray:
@@ -925,6 +936,7 @@ def _run_model_step(
     precision: str,
     use_vq: bool,
     freq_span_map: torch.Tensor,
+    valid_mask: torch.Tensor,
     args,
     current_vq_beta: float,
     epoch: int,
@@ -946,6 +958,7 @@ def _run_model_step(
         pred_imgs=recon_imgs,
         target_imgs=imgs.float(),
         freq_span_map=freq_span_map,
+        valid_mask=valid_mask,
         weight_mag_hf=args.weight_mag_hf,
     )
     recon_loss = args.weight_mag * loss_mag + args.weight_phase * loss_phase
@@ -1114,6 +1127,7 @@ def train_main(args) -> None:
         print(f"[INFO] ICFT spatial chunk: {converter.icft_spatial_chunk_size}")
 
     freq_span_map = compute_freq_span_map(converter, device=device)
+    valid_mask = compute_valid_mask(converter, device=device)
 
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
     model_to_save = model.module if isinstance(model, DDP) else model
@@ -1259,6 +1273,7 @@ def train_main(args) -> None:
                     precision=args.precision,
                     use_vq=use_vq,
                     freq_span_map=freq_span_map,
+                    valid_mask=valid_mask,
                     args=args,
                     current_vq_beta=current_vq_beta,
                     epoch=epoch,
@@ -1323,6 +1338,7 @@ def train_main(args) -> None:
                             precision=args.precision,
                             use_vq=use_vq,
                             freq_span_map=freq_span_map,
+                            valid_mask=valid_mask,
                             args=args,
                             current_vq_beta=current_vq_beta,
                             epoch=epoch,

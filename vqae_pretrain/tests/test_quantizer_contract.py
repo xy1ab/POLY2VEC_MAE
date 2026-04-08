@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from unittest import mock
 import torch
 import unittest
 
@@ -62,6 +63,44 @@ class QuantizerContractTest(unittest.TestCase):
 
         self.assertTrue(quantizer.is_initialized)
         self.assertEqual(quantizer.codebook.shape, (8, 4))
+
+    def test_no_broadcast_when_dead_code_restart_is_disabled(self) -> None:
+        """Forward should skip broadcast when dead-code restart cannot happen."""
+        quantizer = EMAVectorQuantizer(
+            num_embeddings=8,
+            embedding_dim=4,
+            decay=0.99,
+            eps=1.0e-5,
+            dead_code_threshold=0.0,
+            query_chunk_size=8,
+        )
+        quantizer.train()
+        latents = torch.randn(1, 4, 2, 2)
+
+        with mock.patch.object(quantizer, "_broadcast_state_from_rank0") as broadcast_mock:
+            quantizer(latents)
+
+        broadcast_mock.assert_not_called()
+
+    def test_broadcast_occurs_only_when_dead_codes_are_restarted(self) -> None:
+        """Forward should broadcast state only after a rank-local dead-code restart."""
+        quantizer = EMAVectorQuantizer(
+            num_embeddings=8,
+            embedding_dim=4,
+            decay=0.99,
+            eps=1.0e-5,
+            dead_code_threshold=1.0,
+            query_chunk_size=8,
+        )
+        quantizer.train()
+        latents = torch.randn(1, 4, 2, 2)
+
+        with mock.patch.object(quantizer, "_restart_dead_codes", return_value=True) as restart_mock:
+            with mock.patch.object(quantizer, "_broadcast_state_from_rank0") as broadcast_mock:
+                quantizer(latents)
+
+        restart_mock.assert_called_once()
+        broadcast_mock.assert_called_once()
 
 
 if __name__ == "__main__":

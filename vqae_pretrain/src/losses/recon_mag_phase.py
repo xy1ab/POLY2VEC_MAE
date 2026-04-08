@@ -13,6 +13,7 @@ def compute_mag_phase_losses(
     pred_imgs: torch.Tensor,
     target_imgs: torch.Tensor,
     freq_span_map: torch.Tensor,
+    valid_mask: torch.Tensor,
     weight_mag_hf: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute VQAE magnitude and phase losses on full frequency images.
@@ -21,6 +22,7 @@ def compute_mag_phase_losses(
         pred_imgs: VQAE reconstructed frequency images `[B,3,H,W]`.
         target_imgs: Ground-truth frequency images `[B,3,H,W]`.
         freq_span_map: Frequency-area weight map `[1,1,H,W]`.
+        valid_mask: Binary valid-region mask `[1,1,H,W]`.
         weight_mag_hf: Weight for high-frequency magnitude penalty.
 
     Returns:
@@ -34,14 +36,17 @@ def compute_mag_phase_losses(
     pred_cos = pred_imgs[:, 1:2]
     pred_sin = pred_imgs[:, 2:3]
 
-    mag_l1 = torch.abs(pred_mag - target_mag)
-    loss_mag_base = mag_l1.mean()
+    valid_mask = valid_mask.to(dtype=pred_imgs.dtype, device=pred_imgs.device)
+    valid_denom = valid_mask.sum().clamp_min(1.0)
 
-    weighted_mag = mag_l1 * freq_span_map
-    loss_mag_penalty = weighted_mag.mean()
+    mag_l1 = torch.abs(pred_mag - target_mag)
+    loss_mag_base = (mag_l1 * valid_mask).sum() / valid_denom
+
+    weighted_mag = mag_l1 * freq_span_map * valid_mask
+    loss_mag_penalty = weighted_mag.sum() / valid_denom
     loss_mag = loss_mag_base + weight_mag_hf * loss_mag_penalty
 
-    phase_l1 = torch.abs(pred_cos - target_cos) + torch.abs(pred_sin - target_sin)
-    loss_phase = phase_l1.mean()
+    phase_l1 = (torch.abs(pred_cos - target_cos) + torch.abs(pred_sin - target_sin)) * valid_mask
+    loss_phase = phase_l1.sum() / valid_denom
 
     return loss_mag, loss_phase
