@@ -255,7 +255,11 @@ class PolyMaeReconstructionPipeline:
         mask_map = mask_seq.reshape(batch_size, h_p, w_p, 1, 1).expand(-1, -1, -1, patch_size, patch_size)
         mask_map = mask_map.permute(0, 1, 3, 2, 4).reshape(batch_size, 1, h, w)
 
-        recon_imgs = imgs * (1 - mask_map) + pred_img * mask_map
+        loss_mode = str(self.config.get("loss_mode", "mask")).lower()
+        if loss_mode == "full":
+            recon_imgs = pred_img
+        else:
+            recon_imgs = imgs * (1 - mask_map) + pred_img * mask_map
         recon_valid = recon_imgs[:, :, : self.valid_h, : self.valid_w]
 
         mag_valid = recon_valid[:, 0, :, :]
