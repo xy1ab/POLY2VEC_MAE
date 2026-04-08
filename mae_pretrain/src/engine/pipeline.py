@@ -122,7 +122,7 @@ class PolyEncoderPipeline:
         imgs = imgs.to(device=self.device, dtype=torch.float32)
         with autocast_context(self.device, self.precision):
             encoder_features = self.encoder(imgs)
-        return encoder_features[:, 0, :].float()
+        return encoder_features[:, :, :].float()
 
     @torch.no_grad()
     def triangles_to_embedding(self, triangles_list: Sequence[np.ndarray]) -> torch.Tensor:
