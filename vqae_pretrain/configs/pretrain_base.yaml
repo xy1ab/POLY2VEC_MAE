@@ -55,11 +55,11 @@ weight_phase: 1.0
 # 验证集比例。其余样本用于训练。
 val_ratio: 0.05
 # 学习率 warmup 轮数。该 warmup 从训练开始即生效，可与 VQ warmup 重合。
-warmup_epochs: 8
+warmup_epochs: 20
 # VQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 quantizer。
-vq_warmup_epochs: 12
+vq_warmup_epochs: 25
 # VQ beta warmup 轮数。它在 VQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
-vq_beta_warmup_epochs: 18
+vq_beta_warmup_epochs: 30
 # 学习率调度的最小值。余弦退火后会逐步逼近该值。
 min_lr: 1.0e-6
 
@@ -103,7 +103,7 @@ drop_rate: 0.0
 # 解码器（多 stage attention + conv）
 # =========================
 # 各解码 stage 的通道数，需与 encoder 下采样 stage 数量对齐。
-decoder_stage_channels: "896,704,512"
+decoder_stage_channels: "512,512,256"
 # decoder 最终并不直接输出自由的 `Mag/Cos/Sin` 三通道，
 # 而是先输出两个 raw 通道 `(mag_raw, phase_raw)`，随后在模型内部映射为：
 # - `mag = softplus(mag_raw)`，保证幅值非负；
@@ -115,13 +115,13 @@ decoder_stage_channels: "896,704,512"
 # - global: 使用全局注意力。
 decoder_attention_type: global
 # 各解码 stage 的注意力头数，长度需与 stage 数匹配。
-decoder_attention_heads: "8,8,8"
+decoder_attention_heads: "8,8,4"
 # 各解码 stage 的 attention block 数。设为 0 时该 stage 退化为 conv-only。
-decoder_attention_depths: "8,0,0"
+decoder_attention_depths: "4,0,0"
 # 各解码 stage 的卷积细化 block 数。一般越靠近输出端越重要。
 decoder_conv_depths: "6,5,4"
 # 全分辨率精修残差块数量。设为 0 表示关闭该模块，行为与旧 decoder 一致。
-refine_full_res_depth: 4
+refine_full_res_depth: 2
 # 全分辨率精修模块内部通道数。
 # 设为 0 表示直接沿用 decoder 最后一级输出通道数；
 # 设为正整数时，会先用 1x1 卷积投影到该通道数后再做精修。
@@ -168,9 +168,9 @@ vq_restart_pool_size_per_rank: 4096
 # 训练总 epoch 数。总训练时长约由它与数据规模、batch size 共同决定。
 epochs: 1000
 # 训练 batch 大小。增大可提升吞吐，但也会增加 GPU 显存压力。
-batch_size: 32
+batch_size: 64
 # 基础学习率。实际训练中会先经过 warmup 再进入余弦退火。
-lr: 3.2e-4
+lr: 1e-2
 # AdamW 的权重衰减系数。增大可增强正则化，但过大可能损伤重建细节。
 weight_decay: 0.05
 # 每条样本的在线增强重复次数。训练集虚拟长度会乘以该值。
