@@ -146,12 +146,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 if __name__ == "__main__":
     args = build_arg_parser().parse_args()
-    output_dir = os.path.join(args.output_dir,  'global_vocab_auto.json')
+    
     RAW_DATA_DIR = args.data_dir
     if not os.path.exists(RAW_DATA_DIR):
         os.makedirs(RAW_DATA_DIR)
         print(f"📁 已自动创建数据存放目录: {RAW_DATA_DIR}，请将GDB和CSV放入此目录！")
-    
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir) 
+    output_dir = os.path.join(args.output_dir,  'global_vocab_auto.json')
     data_sources = []
     for file_path in glob.glob(os.path.join(RAW_DATA_DIR, "*.csv")):
         data_sources.append({'type': 'csv', 'path': file_path})
