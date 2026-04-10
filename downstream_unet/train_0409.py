@@ -1,5 +1,5 @@
-# torchrun --nproc_per_node=4 train.py --config configs/recons_unet.yaml
-# python train.py --config configs/recons_unet.yaml  # 单卡
+# torchrun --nproc_per_node=4 train_0409.py --config configs/recons_unet_single.yaml
+# python train_0409.py --config configs/recons_unet_single.yaml  # 单卡
 
 import os
 import sys
@@ -25,9 +25,9 @@ if __package__ in {None, ""}:
 
     import importlib
 
-    V2Dataset = importlib.import_module("downstream_unet.loaders.loader").V2Dataset
+    V2Dataset = importlib.import_module("downstream_unet.loaders.loader_single").V2Dataset
 else:
-    from .loaders.loader import V2Dataset
+    from .loaders.loader_single import V2Dataset
 
 
 def calculate_iou(pred, target, threshold=0.5):

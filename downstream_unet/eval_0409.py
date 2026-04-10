@@ -18,9 +18,9 @@ if __package__ in {None, ""}:
 
     import importlib
 
-    V2Dataset = importlib.import_module("downstream_unet.loaders.loader").V2Dataset
+    V2Dataset = importlib.import_module("downstream_unet.loaders.loader_single").V2Dataset
 else:
-    from .loaders.loader import V2Dataset
+    from .loaders.loader_single import V2Dataset
 
 
 def calculate_metrics(pred, target, input_blur, threshold=0.5):
@@ -52,7 +52,7 @@ def main():
     
     # ========== 1. 路径配置（从 YAML 读取或硬编码） ==========
     # 方式1：从训练配置读取（推荐）
-    config_path = './configs/recons_unet.yaml'
+    config_path = './configs/recons_unet_single.yaml'
     if os.path.exists(config_path):
         with open(config_path, 'r') as f:
             cfg = yaml.safe_load(f)
