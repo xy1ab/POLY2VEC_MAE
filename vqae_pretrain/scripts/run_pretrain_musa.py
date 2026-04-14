@@ -194,6 +194,9 @@ def _normalize_runtime_config(config: dict) -> dict:
     normalized.pop("save_every", None)
     normalized.pop("viz_every", None)
     normalized.pop("export_dir", None)
+    normalized.pop("latent_stride", None)
+    normalized.pop("latent_grid_size", None)
+    normalized.pop("num_latent_tokens", None)
     return normalized
 
 

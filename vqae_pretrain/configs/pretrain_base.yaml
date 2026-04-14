@@ -55,7 +55,7 @@ weight_phase: 1.0
 # 验证集比例。其余样本用于训练。
 val_ratio: 0.05
 # 学习率 warmup 轮数。该 warmup 从训练开始即生效，可与 VQ warmup 重合。
-warmup_epochs: 6
+warmup_epochs: 10
 # VQ warmup 轮数。在这段时期内，模型完全按连续 AE 训练，不启用 quantizer。
 vq_warmup_epochs: 10
 # VQ beta warmup 轮数。它在 VQ warmup 结束后启动，并将 beta 从 0 线性增至 `vq_beta`。
