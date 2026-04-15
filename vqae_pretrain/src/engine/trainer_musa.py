@@ -101,6 +101,23 @@ _RESUME_LOCKED_KEYS = {
 }
 
 
+_DEBUG_ARG_KEYS = {
+    "vq_debug",
+    "vq_debug_interval",
+    "vq_debug_topk",
+    "vq_debug_active_floor",
+    "vq_debug_active_drop_ratio",
+    "vq_debug_top1_ratio",
+    "vq_debug_nearest_check",
+    "vq_debug_nearest_check_size",
+}
+
+
+def _strip_debug_args(config: dict) -> dict:
+    """Remove CLI-only diagnostics from persisted run configuration."""
+    return {key: value for key, value in config.items() if key not in _DEBUG_ARG_KEYS}
+
+
 def mag_phase_to_real_imag(mag_log: torch.Tensor, phase: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Convert log-magnitude and phase channels into real/imaginary components.
 
@@ -471,6 +488,24 @@ def _validate_training_args(args) -> None:
             "`vq_restart_pool_size_per_rank` must be >= 0, "
             f"got {args.vq_restart_pool_size_per_rank}"
         )
+    if args.vq_debug_interval <= 0:
+        raise ValueError(f"`vq_debug_interval` must be > 0, got {args.vq_debug_interval}")
+    if args.vq_debug_topk <= 0:
+        raise ValueError(f"`vq_debug_topk` must be > 0, got {args.vq_debug_topk}")
+    if args.vq_debug_active_floor < 0:
+        raise ValueError(f"`vq_debug_active_floor` must be >= 0, got {args.vq_debug_active_floor}")
+    if not (0.0 <= float(args.vq_debug_active_drop_ratio) <= 1.0):
+        raise ValueError(
+            "`vq_debug_active_drop_ratio` must be in [0, 1], "
+            f"got {args.vq_debug_active_drop_ratio}"
+        )
+    if not (0.0 <= float(args.vq_debug_top1_ratio) <= 1.0):
+        raise ValueError(f"`vq_debug_top1_ratio` must be in [0, 1], got {args.vq_debug_top1_ratio}")
+    if args.vq_debug_nearest_check_size <= 0:
+        raise ValueError(
+            "`vq_debug_nearest_check_size` must be > 0, "
+            f"got {args.vq_debug_nearest_check_size}"
+        )
     if args.refine_full_res_depth < 0:
         raise ValueError(f"`refine_full_res_depth` must be >= 0, got {args.refine_full_res_depth}")
     if args.refine_full_res_channels < 0:
@@ -657,6 +692,252 @@ def _all_reduce_sum(value: torch.Tensor, dist_ctx: DistContext) -> torch.Tensor:
     return out
 
 
+def _all_reduce_with_op(value: torch.Tensor, dist_ctx: DistContext, op: dist.ReduceOp) -> torch.Tensor:
+    """All-reduce one tensor with a specific reduction op when distributed."""
+    if not (dist_ctx.enabled and dist.is_initialized()):
+        return value
+
+    out = value.clone()
+    dist.all_reduce(out, op=op)
+    return out
+
+
+@torch.no_grad()
+def _build_local_vq_latent_debug_stats(
+    z: torch.Tensor,
+    *,
+    nearest_sample_size: int,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Build rank-local statistics for the quantizer input latent."""
+    vectors = z.detach().float().permute(0, 2, 3, 1).reshape(-1, z.shape[1])
+    flat = vectors.reshape(-1)
+    norms = vectors.norm(dim=1)
+
+    sample_count = min(max(1, int(nearest_sample_size)), int(vectors.shape[0]))
+    if sample_count < int(vectors.shape[0]):
+        sample_indices = torch.arange(sample_count, device=vectors.device, dtype=torch.long)
+        sample_indices = sample_indices * int(vectors.shape[0]) // sample_count
+        sample_vectors = vectors.index_select(0, sample_indices)
+    else:
+        sample_vectors = vectors
+
+    stats = {
+        "vector_count": torch.tensor([vectors.shape[0]], device=vectors.device, dtype=torch.float32),
+        "element_count": torch.tensor([flat.numel()], device=vectors.device, dtype=torch.float32),
+        "element_sum": flat.sum().reshape(1),
+        "element_sq_sum": flat.square().sum().reshape(1),
+        "absmax": flat.abs().max().reshape(1),
+        "norm_sum": norms.sum().reshape(1),
+        "norm_sq_sum": norms.square().sum().reshape(1),
+        "norm_min": norms.min().reshape(1),
+        "norm_max": norms.max().reshape(1),
+        "channel_sum": vectors.sum(dim=0),
+        "channel_sq_sum": vectors.square().sum(dim=0),
+    }
+    return stats, sample_vectors.detach()
+
+
+def _register_vq_debug_latent_hook(model_to_save, args) -> tuple[dict, object | None]:
+    """Capture the true quantizer input latent for MUSA-only VQ diagnostics."""
+    debug_state = {"latent_stats": None, "latent_sample": None, "codebook_snapshot": None}
+    if not bool(getattr(args, "vq_debug", False)):
+        return debug_state, None
+
+    def _capture_quantizer_input(module, inputs) -> None:
+        if not bool(module.training) or not inputs:
+            return
+        z = inputs[0]
+        if not torch.is_tensor(z):
+            return
+        stats, sample = _build_local_vq_latent_debug_stats(
+            z,
+            nearest_sample_size=int(args.vq_debug_nearest_check_size),
+        )
+        debug_state["latent_stats"] = stats
+        debug_state["latent_sample"] = sample
+        if bool(args.vq_debug_nearest_check):
+            debug_state["codebook_snapshot"] = module.codebook.detach().float().clone()
+
+    handle = model_to_save.quantizer.register_forward_pre_hook(_capture_quantizer_input)
+    return debug_state, handle
+
+
+def _reduce_vq_latent_debug_stats(local_stats: dict[str, torch.Tensor], dist_ctx: DistContext) -> dict[str, float]:
+    """Reduce quantizer-input latent statistics across all ranks."""
+    vector_count = _all_reduce_sum(local_stats["vector_count"], dist_ctx).clamp_min(1.0)
+    element_count = _all_reduce_sum(local_stats["element_count"], dist_ctx).clamp_min(1.0)
+    element_sum = _all_reduce_sum(local_stats["element_sum"], dist_ctx)
+    element_sq_sum = _all_reduce_sum(local_stats["element_sq_sum"], dist_ctx)
+    absmax = _all_reduce_with_op(local_stats["absmax"], dist_ctx, dist.ReduceOp.MAX)
+
+    norm_sum = _all_reduce_sum(local_stats["norm_sum"], dist_ctx)
+    norm_sq_sum = _all_reduce_sum(local_stats["norm_sq_sum"], dist_ctx)
+    norm_min = _all_reduce_with_op(local_stats["norm_min"], dist_ctx, dist.ReduceOp.MIN)
+    norm_max = _all_reduce_with_op(local_stats["norm_max"], dist_ctx, dist.ReduceOp.MAX)
+
+    channel_sum = _all_reduce_sum(local_stats["channel_sum"], dist_ctx)
+    channel_sq_sum = _all_reduce_sum(local_stats["channel_sq_sum"], dist_ctx)
+
+    mean = element_sum / element_count
+    std = (element_sq_sum / element_count - mean.square()).clamp_min(0.0).sqrt()
+
+    norm_mean = norm_sum / vector_count
+    norm_std = (norm_sq_sum / vector_count - norm_mean.square()).clamp_min(0.0).sqrt()
+
+    channel_mean = channel_sum / vector_count
+    channel_std = (channel_sq_sum / vector_count - channel_mean.square()).clamp_min(0.0).sqrt()
+
+    return {
+        "z_mean": float(mean.item()),
+        "z_std": float(std.item()),
+        "z_absmax": float(absmax.item()),
+        "z_norm_mean": float(norm_mean.item()),
+        "z_norm_std": float(norm_std.item()),
+        "z_norm_min": float(norm_min.item()),
+        "z_norm_max": float(norm_max.item()),
+        "ch_std_mean": float(channel_std.mean().item()),
+        "ch_std_min": float(channel_std.min().item()),
+        "ch_std_max": float(channel_std.max().item()),
+    }
+
+
+def _build_usage_debug_stats(usage_counts: torch.Tensor, topk: int) -> dict:
+    """Build global code-usage concentration diagnostics."""
+    usage = usage_counts.detach().float()
+    usage_sum = usage.sum().clamp_min(1.0)
+    k = min(max(1, int(topk)), int(usage.numel()))
+    top_values, top_indices = torch.topk(usage, k=k)
+    return {
+        "top1_ratio": float((top_values[0] / usage_sum).item()),
+        "topk_ratio": float((top_values.sum() / usage_sum).item()),
+        "top_ids": [int(index.item()) for index in top_indices],
+        "top_counts": [int(value.item()) for value in top_values],
+    }
+
+
+def _build_codebook_debug_stats(quantizer) -> dict[str, float]:
+    """Build local codebook and EMA-count diagnostics."""
+    codebook = quantizer.codebook.detach().float()
+    norms = codebook.norm(dim=1)
+    return {
+        "cb_norm_min": float(norms.min().item()),
+        "cb_norm_mean": float(norms.mean().item()),
+        "cb_norm_max": float(norms.max().item()),
+        "cb_std": float(codebook.std(unbiased=False).item()),
+    }
+
+
+def _build_vector_pool_debug_stats(vectors: torch.Tensor | None) -> dict[str, float | int]:
+    """Summarize one vector pool such as restart replacement candidates."""
+    if vectors is None or vectors.numel() == 0:
+        return {
+            "candidate_count": 0,
+            "candidate_std": 0.0,
+            "candidate_norm_mean": 0.0,
+            "candidate_norm_std": 0.0,
+        }
+
+    vectors = vectors.detach().float()
+    norms = vectors.norm(dim=1)
+    return {
+        "candidate_count": int(vectors.shape[0]),
+        "candidate_std": float(vectors.std(unbiased=False).item()),
+        "candidate_norm_mean": float(norms.mean().item()),
+        "candidate_norm_std": float(norms.std(unbiased=False).item()),
+    }
+
+
+def _global_unique_count(indices: torch.Tensor, *, num_embeddings: int, dist_ctx: DistContext) -> int:
+    """Count globally unique code ids used by one sampled nearest-neighbor path."""
+    local_counts = torch.bincount(indices.long(), minlength=int(num_embeddings)).float()
+    global_counts = _all_reduce_sum(local_counts, dist_ctx)
+    return int((global_counts > 0).sum().item())
+
+
+@torch.no_grad()
+def _run_vq_nearest_debug_check(
+    *,
+    quantizer,
+    local_vectors: torch.Tensor,
+    codebook: torch.Tensor | None,
+    sample_size: int,
+    dist_ctx: DistContext,
+) -> dict:
+    """Compare MUSA formula nearest, MUSA cdist nearest, and CPU fp32 nearest."""
+    device = quantizer.codebook.device
+    codebook = quantizer.codebook if codebook is None else codebook
+    sample_size = max(1, int(sample_size))
+    vectors = local_vectors.detach().float()
+    if vectors.shape[0] > sample_size:
+        vectors = vectors[:sample_size]
+
+    formula_distances = quantizer._compute_distance_chunk(vectors, codebook)
+    formula_indices = torch.argmin(formula_distances, dim=1)
+    formula_unique = _global_unique_count(
+        formula_indices,
+        num_embeddings=int(quantizer.num_embeddings),
+        dist_ctx=dist_ctx,
+    )
+
+    local_count = torch.tensor([int(vectors.shape[0])], device=device, dtype=torch.float32)
+    global_count = _all_reduce_sum(local_count, dist_ctx).clamp_min(1.0)
+    negative_count = _all_reduce_sum((formula_distances < 0).sum().float().reshape(1), dist_ctx)
+    min_distance = _all_reduce_with_op(formula_distances.min().reshape(1), dist_ctx, dist.ReduceOp.MIN)
+
+    cdist_ok = torch.tensor([1], device=device, dtype=torch.int32)
+    try:
+        cdist_indices = torch.argmin(torch.cdist(vectors.float(), codebook.float(), p=2.0), dim=1)
+    except Exception:
+        cdist_ok.zero_()
+        cdist_indices = formula_indices
+    cdist_ok = _all_reduce_with_op(cdist_ok, dist_ctx, dist.ReduceOp.MIN)
+
+    cpu_ok = torch.tensor([1], device=device, dtype=torch.int32)
+    try:
+        vectors_cpu = vectors.detach().float().cpu()
+        codebook_cpu = codebook.detach().float().cpu()
+        cpu_distances = (
+            vectors_cpu.square().sum(dim=1, keepdim=True)
+            + codebook_cpu.square().sum(dim=1).unsqueeze(0)
+            - 2.0 * vectors_cpu @ codebook_cpu.t()
+        )
+        cpu_indices = torch.argmin(cpu_distances, dim=1).to(device=device)
+    except Exception:
+        cpu_ok.zero_()
+        cpu_indices = formula_indices
+    cpu_ok = _all_reduce_with_op(cpu_ok, dist_ctx, dist.ReduceOp.MIN)
+
+    cdist_unique = _global_unique_count(cdist_indices, num_embeddings=int(quantizer.num_embeddings), dist_ctx=dist_ctx)
+    cpu_unique = _global_unique_count(cpu_indices, num_embeddings=int(quantizer.num_embeddings), dist_ctx=dist_ctx)
+
+    formula_cdist_mismatch = _all_reduce_sum((formula_indices != cdist_indices).float().sum().reshape(1), dist_ctx)
+    formula_cpu_mismatch = _all_reduce_sum((formula_indices != cpu_indices).float().sum().reshape(1), dist_ctx)
+    cdist_cpu_mismatch = _all_reduce_sum((cdist_indices != cpu_indices).float().sum().reshape(1), dist_ctx)
+
+    return {
+        "sample": int(global_count.item()),
+        "formula_unique": int(formula_unique),
+        "cdist_unique": int(cdist_unique) if bool(cdist_ok.item()) else None,
+        "cpu_unique": int(cpu_unique) if bool(cpu_ok.item()) else None,
+        "formula_cdist_mismatch": float((formula_cdist_mismatch / global_count).item()) if bool(cdist_ok.item()) else None,
+        "formula_cpu_mismatch": float((formula_cpu_mismatch / global_count).item()) if bool(cpu_ok.item()) else None,
+        "cdist_cpu_mismatch": float((cdist_cpu_mismatch / global_count).item())
+        if bool(cdist_ok.item()) and bool(cpu_ok.item())
+        else None,
+        "neg_dist": int(negative_count.item()),
+        "min_dist": float(min_distance.item()),
+    }
+
+
+def _format_optional(value, fmt: str = ".4f") -> str:
+    """Format optional debug values without raising on unavailable checks."""
+    if value is None:
+        return "NA"
+    if isinstance(value, int):
+        return str(value)
+    return format(float(value), fmt)
+
+
 def _gather_restart_candidates(
     local_candidates: torch.Tensor | None,
     *,
@@ -723,10 +1004,19 @@ def _sync_quantizer_step_state(
     dist_ctx: DistContext,
     apply_ema_update: bool,
     restart_pool_size_per_rank: int,
-) -> None:
+    debug_enabled: bool = False,
+) -> dict:
     """Synchronize VQ stats and trainer-owned EMA updates across ranks."""
+    debug_info = {
+        "dead_before": 0,
+        "restart_happened": False,
+        "candidate_count": 0,
+        "candidate_std": 0.0,
+        "candidate_norm_mean": 0.0,
+        "candidate_norm_std": 0.0,
+    }
     if outputs.usage_counts is None:
-        return
+        return debug_info
 
     global_usage_counts = _all_reduce_sum(outputs.usage_counts.float(), dist_ctx)
     global_perplexity, global_active_codes = quantizer.compute_usage_metrics(global_usage_counts)
@@ -735,7 +1025,7 @@ def _sync_quantizer_step_state(
     outputs.usage_counts = global_usage_counts
 
     if not apply_ema_update:
-        return
+        return debug_info
 
     if outputs.embed_sum is None:
         raise RuntimeError("Training VQ step expected local embed_sum but received None.")
@@ -746,8 +1036,9 @@ def _sync_quantizer_step_state(
 
     dead_code_threshold = float(quantizer.dead_code_threshold)
     dead_code_count = int((quantizer.cluster_size < dead_code_threshold).sum().item()) if dead_code_threshold > 0 else 0
+    debug_info["dead_before"] = dead_code_count
     if dead_code_count <= 0:
-        return
+        return debug_info
 
     restart_candidates = _gather_restart_candidates(
         outputs.restart_candidates,
@@ -756,6 +1047,8 @@ def _sync_quantizer_step_state(
         device=quantizer.codebook.device,
         dist_ctx=dist_ctx,
     )
+    if debug_enabled:
+        debug_info.update(_build_vector_pool_debug_stats(restart_candidates))
 
     restarted_dead_codes = False
     if is_main_process(dist_ctx):
@@ -770,6 +1063,8 @@ def _sync_quantizer_step_state(
         dist.broadcast(restart_flag, src=0)
     if bool(restart_flag.item()):
         _broadcast_quantizer_state(quantizer, dist_ctx)
+    debug_info["restart_happened"] = bool(restart_flag.item())
+    return debug_info
 
 
 def _resolve_training_pt_files(args, warn_fn=None) -> list[Path]:
@@ -1098,13 +1393,15 @@ def _run_model_step(
             restart_pool_size=restart_pool_size_per_rank if use_vq else 0,
         )
 
+    vq_sync_debug = {}
     if use_vq:
-        _sync_quantizer_step_state(
+        vq_sync_debug = _sync_quantizer_step_state(
             outputs=outputs,
             quantizer=model_to_save.quantizer,
             dist_ctx=dist_ctx,
             apply_ema_update=bool(model_to_save.training),
             restart_pool_size_per_rank=restart_pool_size_per_rank,
+            debug_enabled=bool(getattr(args, "vq_debug", False)),
         )
 
     recon_imgs = outputs.recon_imgs.float()
@@ -1146,6 +1443,7 @@ def _run_model_step(
         "vq_loss": vq_loss,
         "weighted_vq": weighted_vq,
         "loss_total": loss_total,
+        "vq_sync_debug": vq_sync_debug,
     }
 
 def count_parameters(model):
@@ -1276,7 +1574,7 @@ def train_main(args) -> None:
     converter = codec.converter
     img_size = (converter.U.shape[0], converter.U.shape[1])
     model_config = _build_model_config(args, img_size=img_size)
-    run_config = dict(vars(args))
+    run_config = _strip_debug_args(dict(vars(args)))
 
     if is_main_process(dist_ctx):
         print(f"[INFO] CFT tri chunk   : {converter.triangle_chunk_size}")
@@ -1287,6 +1585,7 @@ def train_main(args) -> None:
 
     model = _build_model(args, img_size=img_size, device=device, dist_ctx=dist_ctx)
     model_to_save = model.module if isinstance(model, DDP) else model
+    vq_debug_state, vq_debug_hook = _register_vq_debug_latent_hook(model_to_save, args)
     model_config["latent_stride"] = int(model_to_save.encoder.latent_stride)
     model_config["latent_grid_size"] = tuple(int(v) for v in model_to_save.encoder.latent_grid_size)
     model_config["num_latent_tokens"] = int(model_to_save.encoder.num_latent_tokens)
@@ -1297,6 +1596,15 @@ def train_main(args) -> None:
         print(f"[INFO] Latent stride  : {model_config['latent_stride']}")
         print(f"[INFO] Latent grid    : {model_config['latent_grid_size']}")
         print(f"[INFO] Latent tokens  : {model_config['num_latent_tokens']}")
+        if args.vq_debug:
+            print(
+                "[INFO] VQ debug       : "
+                f"enabled interval={args.vq_debug_interval}, topk={args.vq_debug_topk}, "
+                f"active_floor={args.vq_debug_active_floor}, "
+                f"active_drop={args.vq_debug_active_drop_ratio:.2f}, "
+                f"top1={args.vq_debug_top1_ratio:.2f}, "
+                f"nearest_check={args.vq_debug_nearest_check}"
+            )
         _sync_run_metadata(best_dir=best_dir, ckpt_dir=ckpt_dir, run_config=run_config, model_config=model_config)
 
     if resume_state is not None:
@@ -1375,6 +1683,8 @@ def train_main(args) -> None:
 
     if resume_state is not None:
         restore_rng_state(resume_state.get("rng_state"))
+
+    prev_vq_debug_active = None
 
     try:
         for epoch in range(start_epoch, args.epochs):
@@ -1528,6 +1838,117 @@ def train_main(args) -> None:
                         f"topk_usage={[int(v) for v in topk]}"
                     )
 
+                if args.vq_debug and use_vq and step_outputs["outputs"].usage_counts is not None:
+                    usage_debug = _build_usage_debug_stats(
+                        step_outputs["outputs"].usage_counts,
+                        topk=args.vq_debug_topk,
+                    )
+                    active_codes = int(step_outputs["outputs"].active_codes.item())
+                    trigger_reasons = []
+                    if step % args.vq_debug_interval == 0:
+                        trigger_reasons.append("interval")
+                    if active_codes <= int(args.vq_debug_active_floor):
+                        trigger_reasons.append("low_active")
+                    if (
+                        prev_vq_debug_active is not None
+                        and active_codes
+                        < int(prev_vq_debug_active * (1.0 - float(args.vq_debug_active_drop_ratio)))
+                    ):
+                        trigger_reasons.append("active_drop")
+                    if usage_debug["top1_ratio"] >= float(args.vq_debug_top1_ratio):
+                        trigger_reasons.append("top1")
+                    sync_debug = step_outputs.get("vq_sync_debug", {})
+                    if bool(sync_debug.get("restart_happened", False)):
+                        trigger_reasons.append("restart")
+
+                    if trigger_reasons:
+                        local_latent_stats = vq_debug_state.get("latent_stats")
+                        has_latent_stats = torch.tensor(
+                            [int(local_latent_stats is not None)],
+                            device=device,
+                            dtype=torch.int32,
+                        )
+                        has_latent_stats = _all_reduce_with_op(has_latent_stats, dist_ctx, dist.ReduceOp.MIN)
+                        if bool(has_latent_stats.item()):
+                            latent_debug = _reduce_vq_latent_debug_stats(local_latent_stats, dist_ctx)
+                            codebook_debug = _build_codebook_debug_stats(model_to_save.quantizer)
+                            if is_main_process(dist_ctx):
+                                print(
+                                    "[VQDBG] "
+                                    f"ep={epoch + 1} step={step} trigger={','.join(trigger_reasons)} "
+                                    f"beta={current_vq_beta:.4f} loss={loss.item():.4f} "
+                                    f"raw_vq={step_outputs['vq_loss'].item():.4f} "
+                                    f"weighted_vq={step_outputs['weighted_vq'].item():.4f} "
+                                    f"active={active_codes} "
+                                    f"ppl={step_outputs['outputs'].perplexity.item():.2f} "
+                                    f"top1={usage_debug['top1_ratio']:.4f} "
+                                    f"top{min(args.vq_debug_topk, int(step_outputs['outputs'].usage_counts.numel()))}="
+                                    f"{usage_debug['topk_ratio']:.4f} "
+                                    f"z_std={latent_debug['z_std']:.4f} "
+                                    f"z_absmax={latent_debug['z_absmax']:.4f} "
+                                    f"z_norm={latent_debug['z_norm_mean']:.4f}+/-{latent_debug['z_norm_std']:.4f} "
+                                    f"ch_std={latent_debug['ch_std_mean']:.4f}/"
+                                    f"{latent_debug['ch_std_min']:.4f}/"
+                                    f"{latent_debug['ch_std_max']:.4f} "
+                                    f"cb_norm={codebook_debug['cb_norm_min']:.4f}/"
+                                    f"{codebook_debug['cb_norm_mean']:.4f}/"
+                                    f"{codebook_debug['cb_norm_max']:.4f} "
+                                    f"cb_std={codebook_debug['cb_std']:.4f} "
+                                    f"dead={int(sync_debug.get('dead_before', 0))} "
+                                    f"restart={int(bool(sync_debug.get('restart_happened', False)))} "
+                                    f"repl_count={int(sync_debug.get('candidate_count', 0))} "
+                                    f"repl_std={float(sync_debug.get('candidate_std', 0.0)):.4f} "
+                                    f"repl_norm={float(sync_debug.get('candidate_norm_mean', 0.0)):.4f}+/-"
+                                    f"{float(sync_debug.get('candidate_norm_std', 0.0)):.4f} "
+                                    f"top_ids={usage_debug['top_ids']} "
+                                    f"top_counts={usage_debug['top_counts']}"
+                                )
+
+                            nearest_triggered = any(
+                                reason in {"low_active", "active_drop", "top1"}
+                                for reason in trigger_reasons
+                            )
+                            if args.vq_debug_nearest_check and nearest_triggered:
+                                local_sample = vq_debug_state.get("latent_sample")
+                                has_sample = torch.tensor(
+                                    [int(local_sample is not None)],
+                                    device=device,
+                                    dtype=torch.int32,
+                                )
+                                has_sample = _all_reduce_with_op(has_sample, dist_ctx, dist.ReduceOp.MIN)
+                                if bool(has_sample.item()):
+                                    nearest_debug = _run_vq_nearest_debug_check(
+                                        quantizer=model_to_save.quantizer,
+                                        local_vectors=local_sample,
+                                        codebook=vq_debug_state.get("codebook_snapshot"),
+                                        sample_size=args.vq_debug_nearest_check_size,
+                                        dist_ctx=dist_ctx,
+                                    )
+                                    if is_main_process(dist_ctx):
+                                        print(
+                                            "[VQDBG-NN] "
+                                            f"ep={epoch + 1} step={step} "
+                                            f"sample={nearest_debug['sample']} "
+                                            f"formula_unique={nearest_debug['formula_unique']} "
+                                            f"cdist_unique={_format_optional(nearest_debug['cdist_unique'], '.0f')} "
+                                            f"cpu_unique={_format_optional(nearest_debug['cpu_unique'], '.0f')} "
+                                            "formula_cdist_mismatch="
+                                            f"{_format_optional(nearest_debug['formula_cdist_mismatch'])} "
+                                            "formula_cpu_mismatch="
+                                            f"{_format_optional(nearest_debug['formula_cpu_mismatch'])} "
+                                            "cdist_cpu_mismatch="
+                                            f"{_format_optional(nearest_debug['cdist_cpu_mismatch'])} "
+                                            f"neg_dist={nearest_debug['neg_dist']} "
+                                            f"min_dist={nearest_debug['min_dist']:.6f}"
+                                        )
+                        elif is_main_process(dist_ctx):
+                            print(
+                                f"[VQDBG][WARN] ep={epoch + 1} step={step} "
+                                "quantizer latent hook did not capture stats."
+                            )
+
+                    prev_vq_debug_active = active_codes
+
                 if max_train_steps > 0 and train_steps >= max_train_steps:
                     break
 
@@ -1636,7 +2057,7 @@ def train_main(args) -> None:
                     "rng_state": capture_rng_state(),
                     "train_indices": train_indices,
                     "val_indices": val_indices,
-                    "run_config": dict(vars(args)),
+                    "run_config": _strip_debug_args(dict(vars(args))),
                     "model_config": model_config,
                     "run_timestamp": run_timestamp,
                     "run_dir": str(run_dir),
@@ -1654,6 +2075,8 @@ def train_main(args) -> None:
             print("[WARN] Training interrupted by user, starting cleanup...")
         raise
     finally:
+        if vq_debug_hook is not None:
+            vq_debug_hook.remove()
         cleanup_distributed(dist_ctx)
         if torch.musa.is_available():
             torch.musa.empty_cache()
@@ -1732,6 +2155,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=("rank0_local", "all_ranks_gather"),
     )
     parser.add_argument("--vq_init_debug", action="store_true")
+    parser.add_argument("--vq_debug", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_interval", type=int, default=20, help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_topk", type=int, default=10, help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_active_floor", type=int, default=512, help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_active_drop_ratio", type=float, default=0.5, help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_top1_ratio", type=float, default=0.5, help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_nearest_check", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--vq_debug_nearest_check_size", type=int, default=256, help=argparse.SUPPRESS)
 
     parser.add_argument("--epochs", type=int, default=150)
     parser.add_argument("--batch_size", type=int, default=512)
