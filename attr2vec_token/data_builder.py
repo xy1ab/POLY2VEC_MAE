@@ -17,8 +17,8 @@ from tokenizers.pre_tokenizers import Whitespace
 from config import ModelConfig, get_optimal_dim
 
 # # 导入警告控制库，屏蔽一些不影响运行的第三方库底层警告信息
-# import warnings
-# warnings.filterwarnings('ignore')
+import warnings
+warnings.filterwarnings('ignore')
 
 # ==========================================
 # 🛡️ 核心基建配置：绝对文本列白名单
@@ -96,14 +96,14 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         df = load_csv_safely(csv_file)
         if df is None: continue
 
-        table_name = os.path.basename(csv_file)
+        layer_name = os.path.basename(csv_file)
 
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
-        # 加入表头
-        metadata_prefix = f"Table: {table_name} | Columns: {' [SEP] '.join(str_cols)} | Data: "
+        # 加入metadata
+        metadata_prefix = f"[TABLE] {layer_name} [COLUMN] {' [SEP] '.join(str_cols)} [DATA] "
         # 提取语料用于 Tokenizer (包含元数据)
-        corpus.append(table_name)
+        corpus.append(layer_name)
         corpus.extend(str_cols)
         # 提取语料 (单字段级别，用于训练词典)
         for col in str_cols:
@@ -133,8 +133,8 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
                 num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
                 str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
                 
-                # 加入表头
-                metadata_prefix = f"Table: {layer_name} | Columns: {' [SEP] '.join(str_cols)} | Data: "
+                # 加入metadata
+                metadata_prefix = f"[TABLE] {layer_name} [COLUMN] {' [SEP] '.join(str_cols)} [DATA] "
                 corpus.append(layer_name)
                 corpus.extend(str_cols)
                 for col in str_cols:
@@ -161,7 +161,9 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
     else:
         tokenizer = Tokenizer(BPE(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
-        trainer = BpeTrainer(special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"], vocab_size=config.vocab_size)
+        custom_tokens = ["[TABLE]", "[COLUMN]", "[DATA]"]
+        all_special = ["[PAD]", "[UNK]", "[SEP]"] + custom_tokens
+        trainer = BpeTrainer(special_tokens=all_special, vocab_size=config.vocab_size)
         
         os.makedirs(config.output_dir, exist_ok=True)
         temp_corpus_path = os.path.join(config.output_dir, "temp_zrzy_corpus.json")

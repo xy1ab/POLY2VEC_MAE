@@ -9,7 +9,8 @@ import torch
 from tokenizers import Tokenizer
 from config import ModelConfig
 from data_builder import load_csv_safely
-
+import warnings
+warnings.filterwarnings('ignore')
 
 
 def float64_to_three_float32(arr):
@@ -29,13 +30,19 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
     num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
     
+    # 加入metadata
+    metadata_prefix = f"Table: {layer_name} | Columns: {' [SEP] '.join(str_cols)} | Data: "
+    metadata_ids = tokenizer.encode(metadata_prefix).ids
     # 🌟 1. 登记元数据注册表 (Schema Registry)
     if layer_name not in schema_registry:
         schema_registry[layer_name] = {
             "num_cols": num_cols,
             "str_cols": str_cols,
             "num_count": len(num_cols),
-            "str_count": len(str_cols)
+            "str_count": len(str_cols),
+            "metadata_prefix": metadata_prefix,
+            "metadata_token_ids": metadata_ids,
+            "metadata_token_len": len(metadata_ids)
         }
 
     # 🌟 2. 处理数值数据
@@ -81,12 +88,12 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
 # ========================================================
 # 🚀 针对南湖集群优化的流式落盘张量流水线
 # ========================================================
-def build_tensors(config_path, raw_data_dir):
+def build_tensors(config_path):
     print("🚀 启动集群优化版数据张量化流水线 (流式边算边存)...")
     
     config = ModelConfig()
     config.load(config_path)
-    
+    raw_data_dir = config.data_dir
     if not os.path.exists(config.tokenizer_path):
         raise FileNotFoundError("❌ 找不到 tokenizer，请先运行 data_builder.py！")
     tokenizer = Tokenizer.from_file(config.tokenizer_path)
@@ -189,8 +196,7 @@ def build_tensors(config_path, raw_data_dir):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="model_config.json 路径")
-    parser.add_argument("--data_dir", type=str, required=True, help="原始数据目录")
+    parser.add_argument("--config_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr/config.json", help="model_config.json 路径")
     args = parser.parse_args()
     
-    build_tensors(args.config, args.data_dir)
+    build_tensors(args.config_path)
