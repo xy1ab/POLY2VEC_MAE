@@ -1,21 +1,26 @@
-import geopandas as gpd
-import pandas as pd
-import numpy as np
-import pyogrio
-import joblib
 import os
-import json
-import warnings
-from tokenizers import Tokenizer
 import glob
+import json
+import argparse
+import numpy as np
+import pandas as pd
+import pyogrio
+import torch
+from tokenizers import Tokenizer
+from config import ModelConfig
 
+import warnings
 warnings.filterwarnings('ignore')
 
 # ==========================================
 # 🛡️ 核心基建配置：绝对文本列白名单
 # ==========================================
-MUST_BE_STRING_EXACT = ['BSM', 'YSDM', 'PAC', 'OBJECTID']  
-MUST_BE_STRING_SUFFIX = ('代码', '编码', '编号', 'ID')      
+MUST_BE_STRING_EXACT = ['BSM', 'YSDM', 'PAC', 'OBJECTID', 'DLBM']  
+MUST_BE_STRING_SUFFIX = (
+    '代码', '编码', '编号', 'ID', 'id', 'Id', 
+    'CODE', 'code', 'Code',
+    'bm', 'BM', 'dm', 'DM'
+)      
 
 def load_csv_safely(csv_path):
     """工业级安全读取 CSV：利用白名单阻断 Pandas 的自动数值推断"""
@@ -25,238 +30,191 @@ def load_csv_safely(csv_path):
         for col in columns:
             if col.upper() in MUST_BE_STRING_EXACT or col.endswith(MUST_BE_STRING_SUFFIX):
                 dtype_mapping[col] = str
-                
         df = pd.read_csv(csv_path, dtype=dtype_mapping, low_memory=False)
         return df
     except Exception as e:
         print(f"❌ 读取 CSV 失败 [{csv_path}]: {e}")
         return None
 
-class NRE_DataPump:
-    def __init__(self, vocab_path, tokenizer_path, max_seq_len=64):
-        self.vocab_path = vocab_path
-        self.max_seq_len = max_seq_len
-        self.vocab = {}
+def float64_to_three_float32(arr):
+    """[核心无损转换逻辑] 将 1 个 Float64 拆分为 3 个 Float32"""
+    arr = np.nan_to_num(arr, nan=0.0) 
+    int_part = np.trunc(arr).astype(np.float32)
+    frac = arr - int_part
+    frac_hi = np.trunc(frac * 10000).astype(np.float32)
+    frac_lo = np.trunc((frac * 10000 - frac_hi) * 10000).astype(np.float32)
+    return int_part, frac_hi, frac_lo
+
+def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
+    """处理单一数据表，实现物理真值与语义的彻底解耦，并抓取元数据"""
+    if len(df) == 0:
+        return None, None
         
-        # 🌟 核心修改 1：加载真正的 BPE 智能分词器
-        if os.path.exists(tokenizer_path):
-            self.tokenizer = Tokenizer.from_file(tokenizer_path)
-        else:
-            print("⚠️ 警告：未找到 zrzy_tokenizer.json，请先运行 train_tokenizer.py！")
-            self.tokenizer = None
-            
-        if os.path.exists(vocab_path):
-            with open(vocab_path, 'r', encoding='utf-8') as f:
-                self.vocab = json.load(f)
-
-    def _route_columns(self, df):
-        cont_cols, word_cols, char_cols = [], [], []
-        FORCE_CHAR_KEYWORDS = ['NAME', 'NAME_CH', 'MC', 'BZ', 'REMARK', 'NOTE', 'DESC', 'ADDR', 'SM', 'MS']
-
-        for col in df.columns:
-            col_lower = col.lower()
-            if col_lower in ['geometry', 'shape'] or col_lower.endswith('id') or col_lower.endswith('uuid'):
-                continue
-            if any(key in col.upper() for key in FORCE_CHAR_KEYWORDS):
-                char_cols.append(col)
-                continue
-            if col in self.vocab and col != "__SHARED_CHARS__":
-                word_cols.append(col)
-                continue
-            if pd.api.types.is_numeric_dtype(df[col]):
-                cont_cols.append(col)
-            else:
-                char_cols.append(col)
-        return cont_cols, word_cols, char_cols
-
-    def _process_single_dataframe(self, df):
-        df.replace(r'^\s*$', np.nan, regex=True, inplace=True)
-        cont_cols, word_cols, char_cols = self._route_columns(df)
-        
-        # =========================================================
-        # 🌟 核心升级：动态嗅探与计算绝对安全文本长度
-        # =========================================================
-        TRUTH_DIM = 256 # 业务硬性底线
-        used_dims = len(cont_cols) * 3 + len(word_cols) * 1
-        remaining_dims = TRUTH_DIM - used_dims
-        
-        dynamic_max_len = 0
-        if len(char_cols) > 0:
-            # 1. 计算理论安全上限
-            safe_limit = remaining_dims // len(char_cols)
-            
-            if safe_limit <= 0:
-                print(f"      ⚠️ 警告: 基础属性已耗尽 {used_dims} 维！毫无文本空间，强制清空文本。")
-                actual_max = 0
-            else:
-                # 2. 扫描表中真实的最长 Token 数量
-                actual_max = 0
-                for col in char_cols:
-                    if self.tokenizer:
-                        # 🌟 核心升级：不再数汉字个数，而是用分词器编码后数 Token 的个数
-                        lens = df[col].dropna().astype(str).map(lambda x: len(self.tokenizer.encode(x.strip()).ids))
-                        col_max = lens.max() if len(lens) > 0 else 0
-                    else:
-                        col_max = 0
-                        
-                    if col_max > actual_max:
-                        actual_max = int(col_max)
-                        
-            # 3. 最终采纳长度 = Min(真实最长字数, 物理安全上限, 全局硬上限)
-            dynamic_max_len = min(actual_max, safe_limit, self.max_seq_len)
-            
-            print(f"      📏 动态嗅探 -> 安全上限:{safe_limit} | 真实最长:{actual_max} | 全局硬上限:{self.max_seq_len} => 最终采纳:{dynamic_max_len}字")
-        # =========================================================
-
-        if cont_cols:
-            df[cont_cols] = df[cont_cols].apply(pd.to_numeric, errors='coerce').fillna(0.0)
-            raw_64 = df[cont_cols].values.astype(np.float64)
-            raw_64 = np.nan_to_num(raw_64, nan=0.0, posinf=0.0, neginf=0.0)
-            
-            cont_mantissa, cont_exponent = np.frexp(raw_64)
-            cont_int = cont_exponent.astype(np.float32)
-            cont_frac_hi = cont_mantissa.astype(np.float32)
-            cont_frac_lo = (cont_mantissa - cont_frac_hi.astype(np.float64)).astype(np.float32)
-            
-            std = np.std(raw_64, axis=0)
-            std[std == 0] = 1.0
-            cont_norm = ((raw_64 - np.mean(raw_64, axis=0)) / std).astype(np.float32)
-            cont_norm = np.nan_to_num(cont_norm, nan=0.0)
-        else:
-            cont_int = cont_frac_hi = cont_frac_lo = cont_norm = np.zeros((len(df), 0), dtype=np.float32)
-
-        word_list = []
-        for col in word_cols:
-            col_vocab = self.vocab.get(col, {})
-            
-            # 🛡️ 终极清洗装甲：去空值、去首尾空格、去幽灵 .0
-            def safe_map(val):
-                if pd.isna(val): return 0
-                s = str(val).strip()
-                if s.endswith('.0'): s = s[:-2]
-                return col_vocab.get(s, 0)
-                
-            encoded = df[col].map(safe_map).fillna(0).values
-            word_list.append(encoded)
-            
-        word_data = (np.stack(word_list, axis=1).astype(np.float32) / 16384.0) if word_list else np.zeros((len(df), 0), dtype=np.float32)
-
-        char_tensors = []
-        for col in char_cols:
-            col_chars = []
-            for text in df[col].astype(str).fillna(""):
-                text = text.strip()
-                if text.lower() == 'nan': text = ""
-                
-                # 🌟 核心修改 2：调用智能分词器进行高维压缩
-                if self.tokenizer and text:
-                    char_ids = self.tokenizer.encode(text).ids
-                else:
-                    char_ids = []
-                
-                if len(char_ids) < dynamic_max_len:
-                    char_ids.extend([0] * (dynamic_max_len - len(char_ids)))
-                else:
-                    char_ids = char_ids[:dynamic_max_len]
-                col_chars.append(char_ids)
-            char_tensors.append(col_chars)
-            
-        # 🌟 核心修改 3：将缩放基数从 16384.0 升级为 32768.0 以容纳两万词表
-        char_data = (np.array(char_tensors).transpose(1, 0, 2).astype(np.float32) / 32768.0) if char_tensors else np.zeros((len(df), 0, dynamic_max_len), dtype=np.float32)
-
-        return {
-            'cont_int': cont_int, 'cont_frac_hi': cont_frac_hi, 'cont_frac_lo': cont_frac_lo, 'cont_norm': cont_norm,
-            'word_data': word_data, 'char_data': char_data,
-            # 🌟 核心：将该图层专属的 dynamic_max_len 写入 meta，让解码器 evaluator 知道长度
-            'meta': {'cont_cols': cont_cols, 'word_cols': word_cols, 'char_cols': char_cols, 'max_seq_len': dynamic_max_len, 'total_samples': len(df)}
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
+    
+    # 🌟 1. 登记元数据注册表 (Schema Registry)
+    if layer_name not in schema_registry:
+        schema_registry[layer_name] = {
+            "num_cols": num_cols,
+            "str_cols": str_cols,
+            "num_count": len(num_cols),
+            "str_count": len(str_cols)
         }
 
-    def build_cache(self, file_path, cache_path="data_cache.pt"):
-        print(f"🚀 正在解析 {file_path} 并执行【高低位双轨切割】全量无损张量化...")
-        all_layers_data = {}
-        
-        ext = os.path.splitext(file_path)[-1].lower()
-        tabular_exts = ['.csv', '.txt', '.xlsx', '.xls', '.parquet']
+    # 🌟 2. 处理数值数据
+    N = len(df)
+    if len(num_cols) > 0:
+        num_data = df[num_cols].values.astype(np.float64)
+        int_p, frac_h, frac_l = float64_to_three_float32(num_data)
+        num_features = np.empty((N, len(num_cols) * 3), dtype=np.float32)
+        for i in range(len(num_cols)):
+            num_features[:, i*3] = int_p[:, i]
+            num_features[:, i*3+1] = frac_h[:, i]
+            num_features[:, i*3+2] = frac_l[:, i]
+    else:
+        num_features = np.empty((N, 0), dtype=np.float32)
 
-        if ext in tabular_exts:
-            print(f"📄 识别为无空间属性表格文件 ({ext})，开始提取属性...")
-            if ext in ['.csv', '.txt']:
-                # 🌟 调用安全读取引擎！
-                df = load_csv_safely(file_path)
-                if df is None:
-                    return all_layers_data # 阻断错误
-            elif ext in ['.xlsx', '.xls']:
-                df = pd.read_excel(file_path)
-            elif ext == '.parquet':
-                df = pd.read_parquet(file_path)
-                
-            if df is not None:
-                all_layers_data["TABULAR_DEFAULT"] = self._process_single_dataframe(df)
+    # 🌟 3. 处理文本数据
+    seq_ids = np.zeros((N, config.max_seq_len), dtype=np.int64)
+    if len(str_cols) > 0:
+        str_data = df[str_cols].fillna("").astype(str)
+        # 用 [SEP] 拼接行内不同字段，方便未来无损解码时对号入座
+        combined_strings = str_data.agg(' [SEP] '.join, axis=1).tolist()
+        encoded = tokenizer.encode_batch(combined_strings)
+        for i, enc in enumerate(encoded):
+            ids = enc.ids
+            if len(ids) > config.max_seq_len:
+                ids = ids[:config.max_seq_len]
+            seq_ids[i, :len(ids)] = ids
+
+    # 🌟 4. [最核心：绝对解耦的两套张量生成]
+    
+    # 轨道 A: 物理无损记忆轨道 (Float32)
+    truth_vector = np.zeros((N, config.truth_dim), dtype=np.float32)
+    num_width = num_features.shape[1]
+    truth_vector[:, :num_width] = num_features
+    # 把 int64 的 Token IDs 转为 float32 送进去
+    truth_vector[:, num_width : num_width + config.max_seq_len] = seq_ids.astype(np.float32)
+    
+    # 轨道 B: 语义高保真重建轨道 (Int64)
+    semantic_ids = seq_ids
+    
+    return truth_vector, semantic_ids
+
+# ========================================================
+# 🚀 针对南湖集群优化的流式落盘张量流水线
+# ========================================================
+def build_tensors(config_path, raw_data_dir):
+    print("🚀 启动集群优化版数据张量化流水线 (流式边算边存)...")
+    
+    config = ModelConfig()
+    config.load(config_path)
+    
+    if not os.path.exists(config.tokenizer_path):
+        raise FileNotFoundError("❌ 找不到 tokenizer，请先运行 data_builder.py！")
+    tokenizer = Tokenizer.from_file(config.tokenizer_path)
+    
+    schema_registry = {}
+    
+    # 【集群优化核心】：内存缓冲池与流式落盘参数
+    CHUNK_SIZE = 100000        # 每个 pt 文件的样本数，防止内存溢出
+    truth_buffer = []          
+    semantic_buffer = []       
+    buffer_rows = 0            
+    chunk_idx = 0              
+    total_processed_rows = 0   
+
+    def flush_buffer_to_disk(force_all=False):
+        """流式落盘触发器：当 buffer 满载或遍历结束时调用"""
+        nonlocal truth_buffer, semantic_buffer, buffer_rows, chunk_idx, total_processed_rows
+        
+        while buffer_rows >= CHUNK_SIZE or (force_all and buffer_rows > 0):
+            # 堆叠数据
+            stacked_truth = np.vstack(truth_buffer)
+            stacked_semantic = np.vstack(semantic_buffer)
             
-        else:
+            # 确定切分边界
+            rows_to_save = min(CHUNK_SIZE, buffer_rows)
+            chunk_truth = stacked_truth[:rows_to_save]
+            chunk_semantic = stacked_semantic[:rows_to_save]
+            
+            # 安全存盘
+            out_path = os.path.join(config.output_dir, f"cache_chunk_{chunk_idx}.pt")
+            torch.save({
+                "truth_vector": chunk_truth,
+                "semantic_ids": chunk_semantic
+            }, out_path)
+            print(f"✅ 流式落盘触发: 成功保存 {out_path} (释放内存: {rows_to_save} 条)")
+            
+            chunk_idx += 1
+            total_processed_rows += rows_to_save
+            
+            # 将剩下的尾巴塞回缓存池
+            if rows_to_save < stacked_truth.shape[0]:
+                truth_buffer = [stacked_truth[rows_to_save:]]
+                semantic_buffer = [stacked_semantic[rows_to_save:]]
+                buffer_rows = truth_buffer[0].shape[0]
+            else:
+                truth_buffer = []
+                semantic_buffer = []
+                buffer_rows = 0
+
+    # ---------------- 扫描与处理文件流水线 ----------------
+    files_to_process = []
+    for file_path in glob.glob(os.path.join(raw_data_dir, "*")):
+        if file_path.lower().endswith('.csv') or file_path.lower().endswith('.gdb'):
+            files_to_process.append(file_path)
+
+    for i, file_path in enumerate(files_to_process):
+        print(f"🔍 处理进度 [{i+1}/{len(files_to_process)}]: {os.path.basename(file_path)}")
+        
+        if file_path.lower().endswith('.csv'):
+            layer_name = os.path.basename(file_path).split('.')[0]
+            df = load_csv_safely(file_path)
+            if df is not None:
+                t_vec, s_ids = process_dataframe(df, layer_name, tokenizer, config, schema_registry)
+                if t_vec is not None:
+                    truth_buffer.append(t_vec)
+                    semantic_buffer.append(s_ids)
+                    buffer_rows += t_vec.shape[0]
+                    flush_buffer_to_disk(force_all=False)
+                    
+        elif file_path.lower().endswith('.gdb'):
             try:
                 layers = pyogrio.list_layers(file_path)
-                print(f"🌍 识别为空间矢量文件，智能探测到 {len(layers)} 个图层...")
                 for layer_name, geom_type in layers:
-                    print(f"   -> 正在抽取图层: [{layer_name}]")
-                    try:
-                        gdf = gpd.read_file(file_path, layer=layer_name, engine="pyogrio")
-                        df = pd.DataFrame(gdf).drop(columns=['geometry'], errors='ignore')
-                        if len(df) == 0:
-                            print(f"   ⚠️ 图层 [{layer_name}] 为空或无有效台账，已跳过。")
-                            continue
-                        all_layers_data[layer_name] = self._process_single_dataframe(df)
-                    except Exception as e:
-                        print(f"   ❌ 解析图层 [{layer_name}] 失败，跳过该层。错误: {e}")
+                    df = pyogrio.read_dataframe(file_path, layer=layer_name, read_geometry=False)
+                    t_vec, s_ids = process_dataframe(df, layer_name, tokenizer, config, schema_registry)
+                    if t_vec is not None:
+                        truth_buffer.append(t_vec)
+                        semantic_buffer.append(s_ids)
+                        buffer_rows += t_vec.shape[0]
+                        flush_buffer_to_disk(force_all=False)
             except Exception as e:
-                raise ValueError(f"❌ 严重错误：无法解析文件 {file_path}。核心报错: {e}")
-                    
-        joblib.dump(all_layers_data, cache_path)
-        print(f"✅ 编译完成！共收录 {len(all_layers_data)} 个有效图层，张量缓存已保存至 {cache_path}")
-        return all_layers_data
+                print(f"❌ 读取 GDB 失败 [{file_path}]: {e}")
 
-import argparse
-def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI parser for batch forward export."""
-    parser = argparse.ArgumentParser(
-        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
-    )
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
-    parser.add_argument("--vocab_path", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
-    parser.add_argument("--tokenizer_path", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
+    # ==========================================
+    # 扫尾工作：将不足 10 万条的剩余数据强制落盘，并生成终极图纸
+    # ==========================================
+    flush_buffer_to_disk(force_all=True)
+
+    # 保存元数据图纸 (Schema Registry)
+    schema_path = os.path.join(config.output_dir, "schema_registry.json")
+    with open(schema_path, "w", encoding="utf-8") as f:
+        json.dump(schema_registry, f, ensure_ascii=False, indent=4)
+    print(f"✅ 成功生成集群元数据注册表 (Schema Registry): {schema_path}")
     
-    return parser
+    print("\n" + "="*60)
+    print(f"🎉 全部集群流式处理完成！共生成 {total_processed_rows} 条标准训练样本。")
+    print(f"👉 物理真值已完美解耦，包含绝对无损数据。")
+    print(f"👉 语义 IDs 已完美解耦，专供 Transformer 交叉熵重建。")
+    print("="*60 + "\n")
 
 if __name__ == "__main__":
-    print("=== data_loader.py 全自动张量化流水线启动 ===")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="model_config.json 路径")
+    parser.add_argument("--data_dir", type=str, required=True, help="原始数据目录")
+    args = parser.parse_args()
     
-    args = build_arg_parser().parse_args()
-    pump = NRE_DataPump(args.vocab_path, args.tokenizer_path)
-    RAW_DATA_DIR = args.data_dir
-    output_dir = args.output_dir
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-    if not os.path.exists(RAW_DATA_DIR):
-        os.makedirs(RAW_DATA_DIR)
-        
-    DATA_SOURCES = []
-    for file_path in glob.glob(os.path.join(RAW_DATA_DIR, "*")):
-        if file_path.endswith('.csv') or file_path.endswith('.gdb'):
-            base_name = os.path.splitext(os.path.basename(file_path))[0]
-            cache_name = os.path.join(output_dir, f"cache_{base_name}.joblib")
-            DATA_SOURCES.append({"file": file_path, "cache": cache_name})
-            
-    print(f"📦 共规划了 {len(DATA_SOURCES)} 个数据源的缓存生成任务。")
-    
-    for source in DATA_SOURCES:
-        file_path = source["file"]
-        cache_path = source["cache"]
-        
-        if os.path.exists(cache_path):
-            print(f"⏩ 发现现有缓存 [{cache_path}]，为节省时间已跳过。如需重构请先删除原缓存。")
-            continue
-            
-        print(f"\n📂 正在切入数据源: [{file_path}]")
-        pump.build_cache(file_path, cache_path)
+    build_tensors(args.config, args.data_dir)

@@ -1,114 +1,175 @@
-import os, torch, random, time, json, glob
-import torch.distributed as dist
+import os
+import glob
+import time
+import argparse
+import torch
+import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
+from torch.utils.data import Dataset, DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 from torch.amp import autocast, GradScaler
+
+from config import ModelConfig
 from models import NaturalResourceFoundationModel
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import joblib
-import argparse
-def build_arg_parser() -> argparse.ArgumentParser:
-    """Build CLI parser for batch forward export."""
-    parser = argparse.ArgumentParser(
-        description="Batch forward triangulated polygon shards into embeddings and MAE frequency maps."
-    )
-    parser.add_argument("--cache_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory containing triangulated shard `.pt` files.")
-    parser.add_argument("--vocab_size", type=int, default=8192, help="Vocabulary size for the BPE tokenizer (default: 20000).")
-    return parser
+# ======================================================================
+# 1. 数据集加载器 (直接读取缓存的 PT 文件)
+# ======================================================================
+class NRECacheDataset(Dataset):
+    def __init__(self, cache_dir):
+        super().__init__()
+        self.truth_vectors = []
+        self.string_ids = []
+        
+        pt_files = glob.glob(os.path.join(cache_dir, "cache_*.pt"))
+        if not pt_files:
+            raise FileNotFoundError(f"❌ 在 {cache_dir} 未找到任何缓存文件，请先运行 data_loader.py")
+            
+        print(f"📦 正在汇聚 {len(pt_files)} 个缓存文件中的张量数据...")
+        
+        for file in pt_files:
+            try:
+                data_dict = torch.load(file, weights_only=False)
+                for layer_name, tensors in data_dict.items():
+                    tv = tensors.get('truth_vector')
+                    si = tensors.get('string_ids')
+                    
+                    if tv is not None and si is not None:
+                        self.truth_vectors.append(torch.tensor(tv, dtype=torch.float32))
+                        self.string_ids.append(torch.tensor(si, dtype=torch.long))
+            except Exception as e:
+                print(f"⚠️ 读取 {file} 失败，已跳过: {e}")
 
+        self.truth_vectors = torch.cat(self.truth_vectors, dim=0)
+        self.string_ids = torch.cat(self.string_ids, dim=0)
+        self.total_samples = self.truth_vectors.shape[0]
+        print(f"✅ 数据集装载完毕！总样本数: {self.total_samples}")
+
+    def __len__(self):
+        return self.total_samples
+
+    def __getitem__(self, idx):
+        return self.truth_vectors[idx], self.string_ids[idx]
+
+# ======================================================================
+# 2. 分布式环境初始化
+# ======================================================================
 def setup_ddp():
+    if "LOCAL_RANK" not in os.environ:
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["RANK"] = "0"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
+    
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
 
-def save_visuals(history):
-    plt.figure(figsize=(12, 5))
-    plt.subplot(1, 2, 1); plt.plot(history["loss"], color='#2ca02c'); plt.title('ZRZY-v1 (0.1B) Loss'); plt.grid(True, alpha=0.3)
-    plt.subplot(1, 2, 2); plt.plot(history["lr"], color='#1f77b4'); plt.title('LR Schedule (1000 Epochs)'); plt.grid(True, alpha=0.3)
-    plt.tight_layout(); plt.savefig("training_monitor.png", dpi=150); plt.close()
-
-def load_all_caches(cache_files, is_master):
-    all_layers_data = {}
-    for file in cache_files:
-        if os.path.exists(file):
-            if is_master: print(f"📦 正在装载高速缓存: {file} ...")
-            data = joblib.load(file)
-            all_layers_data.update(data)
-    return all_layers_data
-
-def train():
-    args = build_arg_parser().parse_args()
-    local_rank = setup_ddp(); is_master = (dist.get_rank() == 0)
-    if not os.path.exists(args.output_dir):
-        os.makedirs(args.output_dir, exist_ok=True)
-    # 🌟 安全参数升级：词表 20000，批次下调至 2048 防爆
-    config = {'truth_dim': 256, 'semantic_dim': 256, 'vocab_size': args.vocab_size}
-    batch_size, epochs, base_lr, warmup_epochs = 256, 5, 2e-4, 1
-    
-    model = DDP(NaturalResourceFoundationModel(config).cuda(local_rank), device_ids=[local_rank], find_unused_parameters=False)
-    optimizer = optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0.05)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs)
-    scaler = GradScaler('cuda')
-
-    cache_files = glob.glob(args.cache_dir + "/*.joblib")
-    if is_master: 
-        print(f"🧲 共发现 {len(cache_files)} 个张量缓存文件，准备汇入训练池...")
-
-    data_all = load_all_caches(cache_files, is_master)
-    layer_names = list(data_all.keys())
-    history = {"loss": [], "lr": []}; best_loss = float('inf'); start_time = time.time()
-
-    if is_master:
-        print("="*60)
-        print(f"🚀 [大一统底座] 500 Epochs 任务重燃 | 图层数: {len(layer_names)}")
-        print("="*60)
-
-    for epoch in range(epochs):
-        model.train(); epoch_loss, total_b = 0.0, 0
-        if epoch < warmup_epochs:
-            lr = base_lr * (epoch + 1) / warmup_epochs
-            for pg in optimizer.param_groups: pg['lr'] = lr
-        
-        random.shuffle(layer_names)
-        for idx, ln in enumerate(layer_names):
-            d = data_all[ln]
-            if d['cont_int'].shape[0] < 2: continue
-            
-            ds = TensorDataset(*[torch.from_numpy(d[k]) for k in ['cont_int','cont_frac_hi','cont_frac_lo','cont_norm','word_data','char_data']])
-            sm = DistributedSampler(ds, shuffle=True); sm.set_epoch(epoch)
-            loader = DataLoader(ds, batch_size=batch_size, sampler=sm, num_workers=4, pin_memory=True)
-            
-            for batch in loader:
-                batch = [t.cuda(local_rank, non_blocking=True) for t in batch]
-                optimizer.zero_grad()
-                with autocast('cuda'):
-                    _, loss = model(*batch); loss = loss.mean()
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer); scaler.update()
-                epoch_loss += loss.item(); total_b += 1
-            
-            if is_master and (idx + 1) % max(1, len(layer_names)//2) == 0:
-                print(f"   ⌛ Ep {epoch+1} Progress: {idx+1}/{len(layer_names)} Layers...")
-
-        if epoch >= warmup_epochs: scheduler.step()
-        if is_master and total_b > 0:
-            avg_loss = epoch_loss / total_b
-            curr_lr = optimizer.param_groups[0]['lr']
-            history["loss"].append(avg_loss); history["lr"].append(curr_lr)
-            print(f"📈 Ep {epoch+1:03d}/{epoch} | Loss: {avg_loss:.6f} | LR: {curr_lr:.2e} | T: {time.time()-start_time:.1f}s")
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                torch.save(model.module.state_dict(), os.path.join(args.output_dir,"best_model.pth"))
-                with open(os.path.join(args.output_dir,"train_history.json"), "w") as f: json.dump(history, f)
-
+def cleanup_ddp():
     dist.destroy_process_group()
 
-if __name__ == "__main__": train()
+# ======================================================================
+# 3. 核心训练主循环
+# ======================================================================
+def train():
+    local_rank = setup_ddp()
+    is_master = (dist.get_rank() == 0)
+    
+    # 🌟 1. 启动配置解析 (新增 batch_size 外部调节开关)
+    parser = argparse.ArgumentParser(description="ZrZy Foundation Model Training")
+    parser.add_argument("--cache_dir", type=str, required=True, help="存放 cache_*.pt 的目录")
+    parser.add_argument("--output_dir", type=str, required=True, help="模型权重和日志保存目录")
+    parser.add_argument("--batch_size", type=int, default=256, help="单卡 Batch Size (降低此值以解决 OOM)")
+    args = parser.parse_args()
+    
+    config = ModelConfig()
+    config_path = os.path.join(args.output_dir, "model_config.json")
+    if os.path.exists(config_path):
+        config.load(config_path)
+    else:
+        raise FileNotFoundError(f"❌ 找不到配置文件 {config_path}，无法获知正确的维度信息！")
+        
+    # 🌟 动态覆盖 Batch Size 以防止显存溢出
+    config.batch_size = args.batch_size
+
+    if is_master:
+        print("\n" + "="*60)
+        print("🚀 [南湖大一统底座] 物理/语义解耦架构开始训练")
+        print(f"👉 物理真值轨道维度: {config.truth_dim} (已冻结梯度)")
+        print(f"👉 语义提取轨道维度: {config.semantic_dim} (独立训练 MAE)")
+        print(f"👉 硬件对齐输出维度: {config.final_dim} 维")
+        print(f"👉 当前单卡 Batch Size: {config.batch_size}")
+        print("="*60 + "\n")
+
+    # 2. 构建模型与分布式包裹
+    model = NaturalResourceFoundationModel(config).cuda(local_rank)
+    # 🌟 开启未使用参数检测，允许 to_semantic 头在预训练时暂不更新
+    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = optim.AdamW(trainable_params, lr=config.base_lr, weight_decay=0.05)
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs)
+    scaler = GradScaler('cuda')
+
+    # 3. 加载数据集
+    dataset = NRECacheDataset(args.cache_dir)
+    sampler = DistributedSampler(dataset)
+    dataloader = DataLoader(
+        dataset, 
+        batch_size=config.batch_size, 
+        sampler=sampler, 
+        num_workers=4, 
+        pin_memory=True, 
+        drop_last=True
+    )
+
+    # 4. 开始训练
+    best_loss = float('inf')
+    for epoch in range(config.epochs):
+        sampler.set_epoch(epoch)
+        model.train()
+        epoch_loss = 0.0
+        
+        start_time = time.time()
+        for batch_idx, (truth_vec, str_ids) in enumerate(dataloader):
+            truth_vec = truth_vec.cuda(local_rank, non_blocking=True)
+            str_ids = str_ids.cuda(local_rank, non_blocking=True)
+            
+            optimizer.zero_grad()
+            
+            with autocast('cuda'):
+                _, mae_loss = model(truth_vec, str_ids)
+                loss = mae_loss.mean()
+                
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(trainable_params, 1.0)
+            
+            scaler.step(optimizer)
+            scaler.update()
+            
+            epoch_loss += loss.item()
+            
+        scheduler.step()
+        
+        # 5. 日志与模型保存
+        if is_master:
+            avg_loss = epoch_loss / len(dataloader)
+            elapsed = time.time() - start_time
+            print(f"Epoch [{epoch+1}/{config.epochs}] | Loss: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.2e} | Time: {elapsed:.2f}s")
+            
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                ckpt_path = os.path.join(args.output_dir, "zrzy_foundation_best.pth")
+                torch.save(model.module.state_dict(), ckpt_path)
+                print(f"   💾 发现更低 Loss，已保存权重至 {ckpt_path}")
+
+    cleanup_ddp()
+
+if __name__ == "__main__":
+    train()
