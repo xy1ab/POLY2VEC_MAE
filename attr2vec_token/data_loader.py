@@ -31,7 +31,7 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
     str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
     
     # 加入metadata
-    metadata_prefix = f"Table: {layer_name} | Columns: {' [SEP] '.join(str_cols)} | Data: "
+    metadata_prefix = f"[TABLE] {layer_name} [COLUMN] {' [SEP] '.join(str_cols)} [DATA] "
     metadata_ids = tokenizer.encode(metadata_prefix).ids
     # 🌟 1. 登记元数据注册表 (Schema Registry)
     if layer_name not in schema_registry:
@@ -58,7 +58,7 @@ def process_dataframe(df, layer_name, tokenizer, config, schema_registry):
     else:
         num_features = np.empty((N, 0), dtype=np.float32)
 
-    # 🌟 3. 处理文本数据
+    # 🌟 3. 处理文本数据 最后填PAD
     seq_ids = np.zeros((N, config.max_seq_len), dtype=np.int64)
     if len(str_cols) > 0:
         str_data = df[str_cols].fillna("").astype(str)
