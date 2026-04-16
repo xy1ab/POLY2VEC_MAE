@@ -14,7 +14,7 @@ from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
 # 导入我们自定义的全局参数配置类
-from config import ModelConfig
+from config import ModelConfig, get_optimal_dim
 
 # 导入警告控制库，屏蔽一些不影响运行的第三方库底层警告信息
 import warnings
@@ -95,20 +95,26 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
     for csv_file in csv_files:
         df = load_csv_safely(csv_file)
         if df is None: continue
-        
+
+        table_name = os.path.basename(csv_file)
+
         num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
         str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
-        
+        # 加入表头
+        metadata_prefix = f"Table: {table_name} | Columns: {' [SEP] '.join(str_cols)} | Data: "
+        # 提取语料用于 Tokenizer (包含元数据)
+        corpus.append(table_name)
+        corpus.extend(str_cols)
         # 提取语料 (单字段级别，用于训练词典)
         for col in str_cols:
             valid_texts = df[col].dropna().astype(str).unique().tolist()
             corpus.extend([t.strip() for t in valid_texts if t.strip()])
             
-        # 记录当前这张表的特征：数值所需维度 和 所有的长文本组合
+        # 记录当前这张表的特征：数值所需维度(double-single) 和 所有的长文本组合
         num_dim = len(num_cols) * 3
         unique_row_strings = []
         if str_cols:
-            unique_row_strings = df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
+            unique_row_strings = metadata_prefix + df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
         
         table_records.append((num_dim, unique_row_strings))
 
@@ -120,12 +126,17 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         try:
             layers = pyogrio.list_layers(gdb_file)
             for layer_name, geom_type in layers:
+                
                 df = pyogrio.read_dataframe(gdb_file, layer=layer_name, read_geometry=False)
                 if len(df) == 0: continue
                 
                 num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
                 str_cols = [c for c in df.columns if not pd.api.types.is_numeric_dtype(df[c]) and c.lower() not in ['geometry', 'shape']]
                 
+                # 加入表头
+                metadata_prefix = f"Table: {layer_name} | Columns: {' [SEP] '.join(str_cols)} | Data: "
+                corpus.append(layer_name)
+                corpus.extend(str_cols)
                 for col in str_cols:
                     valid_texts = df[col].dropna().astype(str).unique().tolist()
                     corpus.extend([t.strip() for t in valid_texts if t.strip()])
@@ -133,7 +144,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
                 num_dim = len(num_cols) * 3
                 unique_row_strings = []
                 if str_cols:
-                    unique_row_strings = df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
+                    unique_row_strings = metadata_prefix + df[str_cols].fillna("").astype(str).agg(' [SEP] '.join, axis=1).unique()
                 
                 table_records.append((num_dim, unique_row_strings))
         except Exception as e:
@@ -142,7 +153,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
     # ==========================================
     # 4. 训练自然资源专属 BPE 分词器
     # ==========================================
-    corpus = list(set(corpus))
+    # corpus = list(set(corpus))
     print(f"\n🧠 语料收集完毕，共提取 {len(corpus)} 条唯一短语，开始训练 Tokenizer...")
     
     if len(corpus) == 0:
@@ -153,7 +164,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
         trainer = BpeTrainer(special_tokens=["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"], vocab_size=config.vocab_size)
         
         os.makedirs(config.output_dir, exist_ok=True)
-        temp_corpus_path = os.path.join(config.output_dir, "temp_zrzy_corpus.txt")
+        temp_corpus_path = os.path.join(config.output_dir, "temp_zrzy_corpus.json")
         
         with open(temp_corpus_path, "w", encoding="utf-8") as f:
             f.write("\n".join(corpus))
@@ -198,12 +209,8 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
     # ==========================================
     # 6. 更新系统配置与打印审计日志
     # ==========================================
-    final_truth_dim = max(max_global_truth_dim, 64) 
     
-    if final_truth_dim % 2 != 0:
-        final_truth_dim += 1
-        
-    config.truth_dim = final_truth_dim
+    config.truth_dim = get_optimal_dim(max_global_truth_dim, align=64)
     # 存入 max_seq_len，给第二步 DataLoader 提供补齐标准
     config.max_seq_len = max_global_seq_len 
     config.save()
@@ -217,8 +224,8 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZrZy Data Builder: Sniff Dims & Train Tokenizer")
-    parser.add_argument("--data_dir", type=str, required=True, help="存放 CSV 和 GDB 的目录")
-    parser.add_argument("--output_dir", type=str, required=True, help="字典和配置输出目录")
+    parser.add_argument("--data_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/data/raw/", help="存放 CSV 和 GDB 的目录")
+    parser.add_argument("--output_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr", help="字典和配置输出目录")
     args = parser.parse_args()
     
     cfg = ModelConfig()
