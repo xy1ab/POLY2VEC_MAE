@@ -16,9 +16,9 @@ from tokenizers.pre_tokenizers import Whitespace
 # 导入我们自定义的全局参数配置类
 from config import ModelConfig, get_optimal_dim
 
-# 导入警告控制库，屏蔽一些不影响运行的第三方库底层警告信息
-import warnings
-warnings.filterwarnings('ignore')
+# # 导入警告控制库，屏蔽一些不影响运行的第三方库底层警告信息
+# import warnings
+# warnings.filterwarnings('ignore')
 
 # ==========================================
 # 🛡️ 核心基建配置：绝对文本列白名单
@@ -213,7 +213,7 @@ def build_tokenizer_and_sniff_dims(config: ModelConfig, raw_data_dir: str):
     config.truth_dim = get_optimal_dim(max_global_truth_dim, align=64)
     # 存入 max_seq_len，给第二步 DataLoader 提供补齐标准
     config.max_seq_len = max_global_seq_len 
-    config.save()
+    config.save(args.config_path)
     
     print("\n" + "="*65)
     print("✅ [架构第一步] 数据扫描与超参自适应配置完成")
@@ -226,6 +226,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ZrZy Data Builder: Sniff Dims & Train Tokenizer")
     parser.add_argument("--data_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/data/raw/", help="存放 CSV 和 GDB 的目录")
     parser.add_argument("--output_dir", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr", help="字典和配置输出目录")
+    parser.add_argument("--config_path", type=str, default="/mnt/git-data/HB/poly2vec_mae/outputs/attr/config.json", help="config")
     args = parser.parse_args()
     
     cfg = ModelConfig()

@@ -8,33 +8,9 @@ import pyogrio
 import torch
 from tokenizers import Tokenizer
 from config import ModelConfig
+from data_builder import load_csv_safely
 
-import warnings
-warnings.filterwarnings('ignore')
 
-# ==========================================
-# 🛡️ 核心基建配置：绝对文本列白名单
-# ==========================================
-MUST_BE_STRING_EXACT = ['BSM', 'YSDM', 'PAC', 'OBJECTID', 'DLBM']  
-MUST_BE_STRING_SUFFIX = (
-    '代码', '编码', '编号', 'ID', 'id', 'Id', 
-    'CODE', 'code', 'Code',
-    'bm', 'BM', 'dm', 'DM'
-)      
-
-def load_csv_safely(csv_path):
-    """工业级安全读取 CSV：利用白名单阻断 Pandas 的自动数值推断"""
-    try:
-        columns = pd.read_csv(csv_path, nrows=0).columns.tolist()
-        dtype_mapping = {}
-        for col in columns:
-            if col.upper() in MUST_BE_STRING_EXACT or col.endswith(MUST_BE_STRING_SUFFIX):
-                dtype_mapping[col] = str
-        df = pd.read_csv(csv_path, dtype=dtype_mapping, low_memory=False)
-        return df
-    except Exception as e:
-        print(f"❌ 读取 CSV 失败 [{csv_path}]: {e}")
-        return None
 
 def float64_to_three_float32(arr):
     """[核心无损转换逻辑] 将 1 个 Float64 拆分为 3 个 Float32"""
