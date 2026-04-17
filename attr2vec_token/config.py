@@ -16,7 +16,7 @@ class ModelConfig:
         
         # 🌟 0.1B FT-Transformer 参数
         self.embed_dim = 768         
-        self.vocab_size = 20000      
+        self.vocab_size = 65536      
         self.tf_layers = 12          
         self.tf_heads = 12           
         
