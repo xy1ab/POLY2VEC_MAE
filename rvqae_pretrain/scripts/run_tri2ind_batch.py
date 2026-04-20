@@ -8,7 +8,7 @@ from datetime import datetime
 import multiprocessing as mp
 from pathlib import Path
 import sys
-
+import torch
 import numpy as np
 from tqdm import tqdm
 
@@ -103,14 +103,15 @@ def main() -> None:
         helpers = importlib.import_module("rvqae_pretrain.scripts.batch_infer_common")
     else:
         from . import batch_infer_common as helpers
-
+    num_gpus = torch.cuda.device_count()
+    default_gpus = ",".join(map(str, range(num_gpus)))
     parser = argparse.ArgumentParser(description="Encode triangle shards to RVQ indices (with meta).")
     parser.add_argument("--tri_dir", type=str, required=True, help="Directory containing triangle+meta shard files.")
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for tri2ind shards.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Per-GPU inference micro-batch size.")
+    parser.add_argument("--batch_size", type=int, default=1024, help="Per-GPU inference micro-batch size.")
     parser.add_argument("--device", type=str, default="cuda", help="Fallback single runtime device.")
-    parser.add_argument("--gpus", type=str, default="", help="GPU id CSV for multi-GPU workers, e.g. `0,1,2,3`.")
+    parser.add_argument("--gpus", type=str, default=default_gpus, help=f"GPU id CSV for multi-GPU workers (default: all available, currently {default_gpus}).")
     args = parser.parse_args()
 
     if args.batch_size <= 0:
@@ -130,7 +131,7 @@ def main() -> None:
     executors: list[ProcessPoolExecutor] = []
     mp_context = mp.get_context("spawn")
     shard_records = []
-    import torch
+
 
     try:
         for device in worker_devices:

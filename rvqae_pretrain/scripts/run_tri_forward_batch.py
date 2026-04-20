@@ -8,10 +8,10 @@ from datetime import datetime
 import multiprocessing as mp
 from pathlib import Path
 import sys
-
+import torch
 import numpy as np
 from tqdm import tqdm
-
+import matplotlib.path as mpltPath
 if __package__ in {None, ""}:
     _CURRENT_DIR = Path(__file__).resolve().parent
     _PROJECT_ROOT = _CURRENT_DIR.parent
@@ -60,12 +60,28 @@ def _init_worker(repo_root: str, checkpoint_path: str, config_path: str, device:
         precision="fp32",
     )
 
+def rasterize_triangles(tris_batch, sample_nicfts) -> np.ndarray:
+    results = []
+    for tris, nicft in zip(tris_batch, sample_nicfts):
+
+        x = np.linspace(-1, 1, nicft)
+        y = np.linspace(1, -1, nicft)
+        x_grid, y_grid = np.meshgrid(x, y)
+        points = np.vstack((x_grid.flatten(), y_grid.flatten())).T
+        mask = np.zeros(nicft * nicft, dtype=bool)
+        for tri in tris:
+            path = mpltPath.Path(tri)
+            mask = mask | path.contains_points(points)
+        results.append(mask.reshape(nicft, nicft))
+    return results
 
 def _process_one_batch(
     start_index: int,
     tri_batch,
     meta_batch,
     nicft: int,
+    resolution: int,
+    rec_flag: bool = False
 ):
     """Process one triangle batch and return output records with global start index."""
     global _WORKER_PIPELINE, _WORKER_HELPERS
@@ -75,6 +91,8 @@ def _process_one_batch(
     import torch
 
     imgs = _WORKER_PIPELINE.triangles_to_images(tri_batch)
+
+    
     with torch.no_grad():
         outputs = _WORKER_PIPELINE.model(imgs, use_vq=True)
 
@@ -92,48 +110,61 @@ def _process_one_batch(
     real_batch = (raw_mag_valid * torch.cos(phase_valid)).float().cpu()
     imag_batch = (raw_mag_valid * torch.sin(phase_valid)).float().cpu()
 
-    icft_batch = None
-    if int(nicft) > 0:
-        real_for_icft = real_batch.to(_WORKER_PIPELINE.device)
-        imag_for_icft = imag_batch.to(_WORKER_PIPELINE.device)
-        target_h = int(_WORKER_PIPELINE.codec.converter.U.shape[0])
-        target_w = int(_WORKER_PIPELINE.codec.converter.U.shape[1])
-        if real_for_icft.shape[1] > target_h or real_for_icft.shape[2] > target_w:
-            raise ValueError(
-                "Decoded valid frequency grid is larger than codec full grid: "
-                f"decoded={tuple(real_for_icft.shape)}, full=({target_h}, {target_w})"
-            )
-        if real_for_icft.shape[1] != target_h or real_for_icft.shape[2] != target_w:
-            padded_real = torch.zeros(
-                (real_for_icft.shape[0], target_h, target_w),
-                dtype=real_for_icft.dtype,
-                device=real_for_icft.device,
-            )
-            padded_imag = torch.zeros(
-                (imag_for_icft.shape[0], target_h, target_w),
-                dtype=imag_for_icft.dtype,
-                device=imag_for_icft.device,
-            )
-            padded_real[:, : real_for_icft.shape[1], : real_for_icft.shape[2]] = real_for_icft
-            padded_imag[:, : imag_for_icft.shape[1], : imag_for_icft.shape[2]] = imag_for_icft
-            real_for_icft = padded_real
-            imag_for_icft = padded_imag
-        icft_batch = _WORKER_PIPELINE.codec.icft_2d(
-            real_for_icft,
-            f_uv_imag=imag_for_icft,
-            spatial_size=int(nicft),
-        ).float().cpu()
+    n_samples = len(tri_batch)
+    sample_nicfts = []
+    if int(resolution) > 0:
+        for metadata in meta_batch:
+            dL = metadata[2]
+            sample_nicfts.append(int(np.ceil(dL * 118000 / resolution)))
+    else:
+        sample_nicfts = [int(nicft)] * n_samples
+
+    if rec_flag:
+        rec_label = rasterize_triangles(tri_batch, sample_nicfts)
+    # 逐个处理 ICFT
+    icft_batch = [None] * n_samples
+    target_h = int(_WORKER_PIPELINE.codec.converter.U.shape[0])
+    target_w = int(_WORKER_PIPELINE.codec.converter.U.shape[1])
+    
+    device = _WORKER_PIPELINE.device
+    
+    for i in range(n_samples):
+        if sample_nicfts[i] > 0:
+            real_for_icft = real_batch[i].to(device)
+            imag_for_icft = imag_batch[i].to(device)
+            
+            # 填充逻辑
+            if real_for_icft.shape[0] > target_h or real_for_icft.shape[1] > target_w:
+                raise ValueError(f"Decoded grid {real_for_icft.shape} exceeds full grid ({target_h}, {target_w})")
+            
+            if real_for_icft.shape[0] != target_h or real_for_icft.shape[1] != target_w:
+                padded_real = torch.zeros((target_h, target_w), dtype=real_for_icft.dtype, device=device)
+                padded_imag = torch.zeros((target_h, target_w), dtype=imag_for_icft.dtype, device=device)
+                padded_real[:real_for_icft.shape[0], :real_for_icft.shape[1]] = real_for_icft
+                padded_imag[:imag_for_icft.shape[0], :imag_for_icft.shape[1]] = imag_for_icft
+                real_for_icft, imag_for_icft = padded_real, padded_imag
+            
+            # 执行 ICFT
+            icft_res = _WORKER_PIPELINE.codec.icft_2d(
+                f_uv_real=real_for_icft.unsqueeze(0),
+                f_uv_imag=imag_for_icft.unsqueeze(0),
+                spatial_size=sample_nicfts[i],
+            ).float().cpu().squeeze(0)
+            
+            icft_batch[i] = icft_res
 
     records = []
     for sample_offset in range(len(tri_batch)):
         record = {
             "indices": indices_batch_u16[sample_offset].cpu(),
-            "meta": torch.as_tensor(meta_batch[sample_offset], dtype=torch.float32).cpu(),
-            "real": real_batch[sample_offset].float().cpu(),
-            "imag": imag_batch[sample_offset].float().cpu(),
+            "meta": torch.as_tensor(meta_batch[sample_offset], dtype=torch.float32).cpu().numpy(),
+            "real": real_batch[sample_offset].float().cpu().numpy(),
+            "imag": imag_batch[sample_offset].float().cpu().numpy(),
         }
         if icft_batch is not None:
-            record["icft"] = icft_batch[sample_offset].float().cpu()
+            record["icft"] = icft_batch[sample_offset].float().cpu().numpy()
+        if rec_label:
+            record['rec_label'] = rec_label[sample_offset]
         records.append(record)
 
     return {
@@ -154,20 +185,26 @@ def main() -> None:
     else:
         from . import batch_infer_common as helpers
 
+    num_gpus = torch.cuda.device_count()
+    default_gpus = ",".join(map(str, range(num_gpus)))
     parser = argparse.ArgumentParser(description="Full-forward RVQAE export for triangle shards.")
     parser.add_argument("--tri_dir", type=str, required=True, help="Directory containing triangle+meta shard files.")
     parser.add_argument("--model_dir", type=str, required=True, help="Training `best` directory or its parent.")
     parser.add_argument("--output_dir", type=str, required=True, help="Output directory for tri_forward shards.")
-    parser.add_argument("--nicft", type=int, default=0, help="ICFT output size. <=0 disables ICFT export.")
-    parser.add_argument("--batch_size", type=int, default=64, help="Per-GPU inference micro-batch size.")
+    parser.add_argument("--nicft", type=int, default=256, help="ICFT output size. <=0 disables ICFT export.")
+    parser.add_argument("--resolution", type=int, default=0, help="Spatial resolution of the output remote sensing data in meters (e.g., 2 for 2m).")
+    parser.add_argument("--rec_flag", type=bool, default=True, help="Save raw image output")
+    parser.add_argument("--batch_size", type=int, default=512, help="Per-GPU inference micro-batch size.")
     parser.add_argument("--device", type=str, default="cuda", help="Fallback single runtime device.")
-    parser.add_argument("--gpus", type=str, default="", help="GPU id CSV for multi-GPU workers, e.g. `0,1,2,3`.")
+    parser.add_argument("--gpus", type=str, default=default_gpus, help=f"GPU id CSV for multi-GPU workers (default: all available, currently {default_gpus}).")
     args = parser.parse_args()
 
     if args.batch_size <= 0:
         raise ValueError(f"`batch_size` must be > 0, got {args.batch_size}")
     if args.nicft < 0:
         raise ValueError(f"`nicft` must be >= 0, got {args.nicft}")
+    if args.resolution < 0:
+        raise ValueError(f"`resolution` must be >= 0, got {args.resolution}")
 
     worker_devices = helpers.parse_gpu_devices(args.gpus, fallback_device=args.device)
     checkpoint_path, config_path = helpers.resolve_model_paths(args.model_dir)
@@ -183,7 +220,7 @@ def main() -> None:
     executors: list[ProcessPoolExecutor] = []
     mp_context = mp.get_context("spawn")
     shard_records = []
-    import torch
+
 
     try:
         for device in worker_devices:
@@ -214,7 +251,7 @@ def main() -> None:
                     tri_batch = [np.asarray(sample, dtype=np.float32) for sample in tri_samples[start:end]]
                     meta_batch = meta_samples[start:end]
                     executor = executors[batch_index % len(executors)]
-                    futures.append(executor.submit(_process_one_batch, int(start), tri_batch, meta_batch, int(args.nicft)))
+                    futures.append(executor.submit(_process_one_batch, int(start), tri_batch, meta_batch, int(args.nicft), int(args.resolution), args.rec_flag))
                     batch_index += 1
 
                 with tqdm(
@@ -272,7 +309,9 @@ def main() -> None:
             "gpus": str(args.gpus),
             "worker_devices": worker_devices,
             "nicft": int(args.nicft),
+            "resolution": int(args.resolution),
             "project_root": str(project_root),
+            "rec_flag": bool(args.rec_flag),
         },
         shard_records=shard_records,
     )

@@ -5,6 +5,7 @@ import os
 import sys
 import time
 from pathlib import Path
+import torch_musa
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
